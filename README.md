@@ -8,9 +8,10 @@ zig build -Doptimize=ReleaseFast
 printf '1\n2\n3\n4\n' | ./zig-out/bin/mustat
 ```
 
-`mustat` reports count, minimum, quartiles, median, maximum, interquartile
-range, mean, sample standard deviation, standard error, coefficient of
-variation, and the 90th, 95th, and 99th percentiles.
+The default summary matches `ministat`: count, minimum, maximum, median, mean,
+and sample standard deviation. Use `-x` for quartiles, interquartile range,
+standard error, and coefficient of variation. Use `-p` for the 90th, 95th,
+and 99th percentiles. The flags combine.
 
 With multiple files, each dataset after the first is compared with the first
 using a two-sided Welch t-test. Welch's form avoids assuming equal variances.
@@ -22,12 +23,13 @@ Quantiles use R-7 linear interpolation. Dispersion uses the sample variance
 (`N - 1`). Non-finite inputs are rejected.
 
 ```text
-Usage: mustat [-Ahnq] [-C column] [-c confidence] [-d delimiters] [file ...]
+Usage: mustat [-Ahnpqx] [-C column] [-c confidence] [-d delimiters] [file ...]
 ```
 
 Use `-C` to select a one-based column and `-d` to provide delimiter bytes.
 Blank lines, missing columns, and `#` comments are ignored. Multiple files are
-reported independently; `-` reads standard input.
+reported independently; `-` reads standard input. Use `-h` for adaptive,
+eight-significant-digit number formatting. Use `--help` for usage.
 
 ## Performance
 
