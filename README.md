@@ -78,3 +78,8 @@ bounded multi-selection instead of fully sorting every dataset. Run with:
 ```sh
 zig build benchmark -Doptimize=ReleaseFast
 ```
+
+## Releases
+
+Tags such as `v0.1.0` publish stripped, static Linux binaries for amd64 and
+arm64, plus SHA-256 checksums. The tag must match `build.zig.zon`.

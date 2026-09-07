@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Static Linux binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Publish release assets.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          use-cache: false
+          version: "0.16.0"
+
+      - name: Test
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Build static binaries
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          manifest_version="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)",/\1/p' build.zig.zon)"
+          if [[ "${version}" != "${manifest_version}" ]]; then
+            echo "tag ${version} does not match manifest ${manifest_version}" >&2
+            exit 1
+          fi
+
+          build_one() {
+            local zig_target="$1"
+            local platform="$2"
+            local architecture="$3"
+            local stage="stage/${platform}"
+            local package="mustat-${version}-${platform}"
+            local package_dir="dist/${package}"
+
+            zig build \
+              -Dtarget="${zig_target}" \
+              -Doptimize=ReleaseFast \
+              -Dstatic=true \
+              -Dstrip=true \
+              --prefix "${stage}"
+
+            mkdir -p "${package_dir}"
+            install -m 0755 "${stage}/bin/mustat" "${package_dir}/mustat"
+            install -m 0644 LICENSE.txt README.md "${package_dir}/"
+
+            file "${package_dir}/mustat" | grep -q "${architecture}.*statically linked"
+            tar \
+              --directory dist \
+              --sort=name \
+              --mtime="@0" \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --create \
+              --file=- \
+              "${package}" | gzip -9n >"dist/${package}.tar.gz"
+          }
+
+          build_one x86_64-linux-musl linux-amd64 x86-64
+          build_one aarch64-linux-musl linux-arm64 "ARM aarch64"
+
+          "stage/linux-amd64/bin/mustat" --version | grep -qx "mustat ${version}"
+          (cd dist && sha256sum ./*.tar.gz >SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          assets=(dist/*.tar.gz dist/SHA256SUMS)
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${assets[@]}" \
+              --generate-notes \
+              --title "mustat ${RELEASE_TAG}" \
+              --verify-tag
+          fi

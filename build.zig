@@ -3,6 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug information") orelse false;
+    const static_link = b.option(bool, "static", "Link the executable statically") orelse false;
+    const linkage: ?std.builtin.LinkMode = if (static_link) .static else null;
 
     const module = b.addModule("mustat", .{
         .root_source_file = b.path("src/mustat.zig"),
@@ -16,8 +19,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = &.{.{ .name = "mustat", .module = module }},
         }),
+        .linkage = linkage,
     });
     b.installArtifact(executable);
 
