@@ -31,6 +31,44 @@ Blank lines, missing columns, and `#` comments are ignored. Multiple files are
 reported independently; `-` reads standard input. Use `-h` for adaptive,
 eight-significant-digit number formatting. Use `--help` for usage.
 
+## Example
+
+Using the [`ministat` example](https://github.com/leahneukirchen/ministat#example):
+
+```sh
+cat >iguana <<'EOF'
+50
+200
+150
+400
+750
+400
+150
+EOF
+
+cat >chameleon <<'EOF'
+150
+400
+720
+500
+930
+EOF
+
+./zig-out/bin/mustat -h iguana chameleon
+```
+
+```text
+iguana
+       N           Min           Max        Median           Avg        Stddev
+       7            50           750           200           300     238.04761
+chameleon
+       N           Min           Max        Median           Avg        Stddev
+       5           150           930           500           540     299.08193
+Welch t-test chameleon vs iguana:
+  delta=240 (80%), t=1.4888395, df=7.4254283, p=0.17772184
+  no difference at 95.0% confidence
+```
+
 ## Performance
 
 Input bytes are streamed; only parsed values are retained for exact quantiles.
