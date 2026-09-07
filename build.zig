@@ -30,6 +30,19 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run mustat");
     run_step.dependOn(&run_command.step);
 
+    const benchmark = b.addExecutable(.{
+        .name = "mustat-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mustat", .module = module }},
+        }),
+    });
+    const benchmark_command = b.addRunArtifact(benchmark);
+    const benchmark_step = b.step("benchmark", "Benchmark statistics");
+    benchmark_step.dependOn(&benchmark_command.step);
+
     const tests = b.addTest(.{ .root_module = module });
     const test_command = b.addRunArtifact(tests);
 

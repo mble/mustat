@@ -3,23 +3,28 @@ const mustat = @import("mustat");
 
 const Io = std.Io;
 const kibibyte = 1024;
-const gibibyte = kibibyte * kibibyte * kibibyte;
-const input_bytes_max: usize = if (@sizeOf(usize) == 4)
-    std.math.maxInt(usize)
-else
-    4 * gibibyte;
+const input_buffer_bytes = 64 * kibibyte;
 const output_buffer_bytes = 16 * kibibyte;
 const version = "0.1.0";
+const confidence_default = 95.0;
+
+const TestOutput = enum {
+    enabled,
+    disabled,
+};
 
 const Options = struct {
     column: usize = 1,
+    confidence: f64 = confidence_default,
     delimiters: []const u8 = " \t",
     quiet: bool = false,
+    test_output: TestOutput = .enabled,
     files: []const []const u8 = &.{},
 };
 
 const CliError = error{
     InvalidColumn,
+    InvalidConfidence,
     MissingOptionValue,
     OutOfMemory,
     UnknownOption,
@@ -39,29 +44,36 @@ pub fn main(init: std.process.Init) !void {
         return err;
     } orelse return;
 
-    if (options.files.len == 0) {
-        const input = try readStdin(init.gpa, init.io);
-        defer init.gpa.free(input);
-
-        try report(init.gpa, stdout, "<stdin>", input, options);
-        return;
-    }
-
-    for (options.files) |path| {
-        const input = if (std.mem.eql(u8, path, "-"))
-            try readStdin(init.gpa, init.io)
+    const paths: []const []const u8 = if (options.files.len == 0) &.{"-"} else options.files;
+    var baseline: ?mustat.Stats = null;
+    var baseline_name: []const u8 = undefined;
+    for (paths) |path| {
+        const is_stdin = std.mem.eql(u8, path, "-");
+        const file = if (is_stdin)
+            Io.File.stdin()
         else
-            try Io.Dir.cwd().readFileAlloc(
-                init.io,
-                path,
-                init.gpa,
-                .limited(input_bytes_max),
-            );
-        defer init.gpa.free(input);
+            try Io.Dir.cwd().openFile(init.io, path, .{});
+        defer {
+            if (is_stdin == false) {
+                file.close(init.io);
+            }
+        }
 
-        const name = if (std.mem.eql(u8, path, "-")) "<stdin>" else path;
+        var input_buffer: [input_buffer_bytes]u8 = undefined;
+        var input_file: Io.File.Reader = .initStreaming(file, init.io, &input_buffer);
 
-        try report(init.gpa, stdout, name, input, options);
+        const name = if (is_stdin) "<stdin>" else path;
+
+        const stats = try report(init.gpa, stdout, name, &input_file.interface, &options);
+        if (baseline) |reference| {
+            if (options.test_output == .enabled) {
+                try printTest(stdout, name, &stats, baseline_name, &reference, options.confidence);
+            }
+            continue;
+        }
+
+        baseline = stats;
+        baseline_name = name;
     }
 }
 
@@ -92,28 +104,23 @@ fn parseArgs(
             options.quiet = true;
             continue;
         }
-        if (std.mem.eql(u8, argument, "-A") or std.mem.eql(u8, argument, "-n")) {
+        if (std.mem.eql(u8, argument, "-A")) {
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "-n")) {
+            options.test_output = .disabled;
             continue;
         }
         if (std.mem.eql(u8, argument, "-C") or std.mem.eql(u8, argument, "--column")) {
-            index += 1;
-            if (index == arguments.len) {
-                return error.MissingOptionValue;
-            }
-            options.column = std.fmt.parseInt(usize, arguments[index], 10) catch {
-                return error.InvalidColumn;
-            };
-            if (options.column == 0) {
-                return error.InvalidColumn;
-            }
+            options.column = try parseColumn(try nextArgument(arguments, &index));
             continue;
         }
         if (std.mem.eql(u8, argument, "-d") or std.mem.eql(u8, argument, "--delimiters")) {
-            index += 1;
-            if (index == arguments.len) {
-                return error.MissingOptionValue;
-            }
-            options.delimiters = arguments[index];
+            options.delimiters = try nextArgument(arguments, &index);
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "-c") or std.mem.eql(u8, argument, "--confidence")) {
+            options.confidence = try parseConfidence(try nextArgument(arguments, &index));
             continue;
         }
         if (argument.len > 1 and argument[0] == '-') {
@@ -127,21 +134,51 @@ fn parseArgs(
     return options;
 }
 
-fn readStdin(allocator: std.mem.Allocator, io: Io) ![]u8 {
-    var read_buffer: [64 * kibibyte]u8 = undefined;
-    var file_reader: Io.File.Reader = .initStreaming(.stdin(), io, &read_buffer);
+fn nextArgument(arguments: []const []const u8, index: *usize) CliError![]const u8 {
+    index.* += 1;
+    if (index.* == arguments.len) {
+        return error.MissingOptionValue;
+    }
 
-    return file_reader.interface.allocRemaining(allocator, .limited(input_bytes_max));
+    return arguments[index.*];
+}
+
+fn parseColumn(argument: []const u8) CliError!usize {
+    const column = std.fmt.parseInt(usize, argument, 10) catch {
+        return error.InvalidColumn;
+    };
+    if (column == 0) {
+        return error.InvalidColumn;
+    }
+
+    return column;
+}
+
+fn parseConfidence(argument: []const u8) CliError!f64 {
+    const confidence = std.fmt.parseFloat(f64, argument) catch {
+        return error.InvalidConfidence;
+    };
+    if (std.math.isFinite(confidence) == false) {
+        return error.InvalidConfidence;
+    }
+    if (confidence <= 0.0) {
+        return error.InvalidConfidence;
+    }
+    if (confidence >= 100.0) {
+        return error.InvalidConfidence;
+    }
+
+    return confidence;
 }
 
 fn report(
     allocator: std.mem.Allocator,
     writer: *Io.Writer,
     name: []const u8,
-    input: []const u8,
-    options: Options,
-) !void {
-    const values = mustat.parse(allocator, input, .{
+    reader: *Io.Reader,
+    options: *const Options,
+) !mustat.Stats {
+    const values = mustat.parseReader(allocator, reader, .{
         .column = options.column,
         .delimiters = options.delimiters,
     }) catch |err| {
@@ -177,6 +214,36 @@ fn report(
         stats.p95,
         stats.p99,
     });
+
+    return stats;
+}
+
+fn printTest(
+    writer: *Io.Writer,
+    name: []const u8,
+    stats: *const mustat.Stats,
+    baseline_name: []const u8,
+    baseline: *const mustat.Stats,
+    confidence: f64,
+) Io.Writer.Error!void {
+    const result = mustat.welch(stats, baseline) orelse {
+        try writer.print("Welch t-test {s} vs {s}: unavailable\n", .{ name, baseline_name });
+        return;
+    };
+    const alpha = 1.0 - confidence / 100.0;
+    const conclusion = if (result.p_value < alpha) "difference" else "no difference";
+
+    try writer.print("Welch t-test {s} vs {s}:\n", .{ name, baseline_name });
+    try writer.print("  delta={e:.6}", .{result.difference});
+    if (result.relative_percent) |relative| {
+        try writer.print(" ({e:.6}%)", .{relative});
+    }
+    try writer.print(", t={e:.6}, df={e:.6}, p={e:.6}\n", .{
+        result.statistic,
+        result.freedom,
+        result.p_value,
+    });
+    try writer.print("  {s} at {d:.1}% confidence\n", .{ conclusion, confidence });
 }
 
 fn printOptional(writer: *Io.Writer, value: ?f64) Io.Writer.Error!void {
@@ -190,12 +257,14 @@ fn printOptional(writer: *Io.Writer, value: ?f64) Io.Writer.Error!void {
 
 fn usage(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.writeAll(
-        \\Usage: mustat [-Ahnq] [-C column] [-d delimiters] [file ...]
+        \\Usage: mustat [-Ahnq] [-C column] [-c confidence] [-d delimiters] [file ...]
         \\
         \\  -C, --column N       Read one-based column N (default: 1)
+        \\  -c, --confidence N   Set comparison confidence (default: 95)
         \\  -d, --delimiters S   Split on any byte in S (default: space and tab)
         \\  -q, --quiet          Omit headers and dataset names
-        \\  -A, -n               Accepted ministat compatibility flags
+        \\  -A                   Accepted ministat compatibility flag
+        \\  -n                   Suppress comparisons
         \\  -h, --help           Show help
         \\      --version        Show version
         \\
@@ -208,13 +277,36 @@ test "small measurements remain visible" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    try report(
+    const options: Options = .{ .quiet = true };
+    var input: Io.Reader = .fixed("0.000000001\n");
+    _ = try report(
         std.testing.allocator,
         &output.writer,
         "test",
-        "0.000000001\n",
-        .{ .quiet = true },
+        &input,
+        &options,
     );
 
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "1.000000e-9") != null);
+}
+
+test "reject invalid confidence" {
+    try std.testing.expectError(error.InvalidConfidence, parseConfidence("nan"));
+    try std.testing.expectError(error.InvalidConfidence, parseConfidence("0"));
+    try std.testing.expectError(error.InvalidConfidence, parseConfidence("100"));
+}
+
+test "print Welch comparison" {
+    var baseline_values = [_]f64{ 1, 2, 3, 4, 5 };
+    var candidate_values = [_]f64{ 2, 3, 4, 5, 6 };
+    const baseline = mustat.calculate(&baseline_values);
+    const candidate = mustat.calculate(&candidate_values);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try printTest(&output.writer, "new", &candidate, "old", &baseline, 95.0);
+    const heading = std.mem.indexOf(u8, output.written(), "Welch t-test new vs old");
+    try std.testing.expect(heading != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "p=") != null);
 }
