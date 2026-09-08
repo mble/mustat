@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const mustat = @import("mustat");
 
 const Io = std.Io;
@@ -7,7 +8,7 @@ const input_buffer_bytes = 64 * kibibyte;
 const output_buffer_bytes = 16 * kibibyte;
 const number_buffer_bytes = 64;
 const number_width = 13;
-const version = "0.1.0";
+const version = build_options.version;
 const confidence_default = 95.0;
 const percent_scale = 100.0;
 const human_significant_digits = 8;
@@ -60,15 +61,22 @@ const CliError = error{
 };
 
 pub fn main(init: std.process.Init) !void {
-    const arena = init.arena.allocator();
-    const arguments = try init.minimal.args.toSlice(arena);
-
     var stdout_buffer: [output_buffer_bytes]u8 = undefined;
     var stdout_file: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file.interface;
-    defer stdout.flush() catch |err| {
-        std.log.err("stdout: {s}", .{@errorName(err)});
-    };
+
+    return finish_output(stdout, run(init, stdout));
+}
+
+fn finish_output(writer: *Io.Writer, result: anyerror!void) anyerror!void {
+    try writer.flush();
+
+    return result;
+}
+
+fn run(init: std.process.Init, stdout: *Io.Writer) !void {
+    const arena = init.arena.allocator();
+    const arguments = try init.minimal.args.toSlice(arena);
 
     var options: Options = .{};
     const parse_result = parse_args(arena, arguments[1..], stdout, &options) catch |err| {
@@ -130,6 +138,8 @@ fn parse_args(
     options: *Options,
 ) (CliError || Io.Writer.Error)!ParseResult {
     var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(allocator);
+
     var index: usize = 0;
 
     while (index < arguments.len) : (index += 1) {
@@ -146,38 +156,35 @@ fn parse_args(
             try stdout.print("mustat {s}\n", .{version});
             return .exit;
         }
-        if (option_matches(argument, "-q", "--quiet")) {
+        if (argument.len > 1 and argument[0] == '-' and argument[1] != '-') {
+            try parse_short(arguments, &index, argument[1..], options);
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--quiet")) {
             options.quiet = true;
             continue;
         }
-        if (option_matches(argument, "-h", "--human")) {
+        if (std.mem.eql(u8, argument, "--human")) {
             options.number_format = .human;
             continue;
         }
-        if (option_matches(argument, "-p", "--percentiles")) {
+        if (std.mem.eql(u8, argument, "--percentiles")) {
             options.percentiles = .included;
             continue;
         }
-        if (option_matches(argument, "-x", "--extended")) {
+        if (std.mem.eql(u8, argument, "--extended")) {
             options.summary = .extended;
             continue;
         }
-        if (std.mem.eql(u8, argument, "-A")) {
-            continue;
-        }
-        if (std.mem.eql(u8, argument, "-n")) {
-            options.test_output = .disabled;
-            continue;
-        }
-        if (option_matches(argument, "-C", "--column")) {
+        if (std.mem.eql(u8, argument, "--column")) {
             options.column = try parse_column(try next_argument(arguments, &index));
             continue;
         }
-        if (option_matches(argument, "-d", "--delimiters")) {
+        if (std.mem.eql(u8, argument, "--delimiters")) {
             options.delimiters = try next_argument(arguments, &index);
             continue;
         }
-        if (option_matches(argument, "-c", "--confidence")) {
+        if (std.mem.eql(u8, argument, "--confidence")) {
             options.confidence = try parse_confidence(try next_argument(arguments, &index));
             continue;
         }
@@ -194,12 +201,56 @@ fn parse_args(
     return .run;
 }
 
-fn option_matches(argument: []const u8, short: []const u8, long: []const u8) bool {
-    if (std.mem.eql(u8, argument, short)) {
-        return true;
+fn parse_short(
+    arguments: []const []const u8,
+    argument_index: *usize,
+    options_text: []const u8,
+    options: *Options,
+) CliError!void {
+    for (options_text, 0..) |option, option_index| {
+        switch (option) {
+            'A' => {},
+            'h' => options.number_format = .human,
+            'n' => options.test_output = .disabled,
+            'p' => options.percentiles = .included,
+            'q' => options.quiet = true,
+            'x' => options.summary = .extended,
+            'C' => {
+                const value = try short_value(arguments, argument_index, options_text, option_index);
+                options.column = try parse_column(value);
+                return;
+            },
+            'c' => {
+                const value = try short_value(arguments, argument_index, options_text, option_index);
+                options.confidence = try parse_confidence(value);
+                return;
+            },
+            'd' => {
+                options.delimiters = try short_value(
+                    arguments,
+                    argument_index,
+                    options_text,
+                    option_index,
+                );
+                return;
+            },
+            else => return error.UnknownOption,
+        }
+    }
+}
+
+fn short_value(
+    arguments: []const []const u8,
+    argument_index: *usize,
+    options_text: []const u8,
+    option_index: usize,
+) CliError![]const u8 {
+    const value_start = option_index + 1;
+    if (value_start < options_text.len) {
+        return options_text[value_start..];
     }
 
-    return std.mem.eql(u8, argument, long);
+    return next_argument(arguments, argument_index);
 }
 
 fn next_argument(arguments: []const []const u8, index: *usize) CliError![]const u8 {
@@ -494,7 +545,7 @@ test "parse output flags" {
     var options: Options = .{};
     const result = try parse_args(
         std.testing.allocator,
-        &.{ "-h", "-p", "-x", "data" },
+        &.{ "-Ahpqxn", "data" },
         &output.writer,
         &options,
     );
@@ -504,6 +555,53 @@ test "parse output flags" {
     try std.testing.expectEqual(NumberFormat.human, options.number_format);
     try std.testing.expectEqual(Percentiles.included, options.percentiles);
     try std.testing.expectEqual(Summary.extended, options.summary);
+    try std.testing.expectEqual(TestOutput.disabled, options.test_output);
+}
+
+test "parse attached option values" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    var options: Options = .{};
+    const result = try parse_args(
+        std.testing.allocator,
+        &.{ "-C2", "-c99", "-d,", "data" },
+        &output.writer,
+        &options,
+    );
+    defer std.testing.allocator.free(options.files);
+
+    try std.testing.expectEqual(ParseResult.run, result);
+    try std.testing.expectEqual(@as(usize, 2), options.column);
+    try std.testing.expectEqual(@as(f64, 99), options.confidence);
+    try std.testing.expectEqualStrings(",", options.delimiters);
+}
+
+test "parse arguments releases storage" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    var options: Options = .{};
+    try std.testing.expectError(
+        error.UnknownOption,
+        parse_args(
+            std.testing.allocator,
+            &.{ "data", "--unknown" },
+            &output.writer,
+            &options,
+        ),
+    );
+}
+
+test "flush errors propagate" {
+    var buffer = [_]u8{'x'};
+    var writer: Io.Writer = .{
+        .vtable = &.{ .drain = Io.Writer.failingDrain },
+        .buffer = &buffer,
+        .end = buffer.len,
+    };
+
+    try std.testing.expectError(error.WriteFailed, finish_output(&writer, {}));
 }
 
 test "select summary headers" {

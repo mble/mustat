@@ -40,6 +40,11 @@ const quantile_probabilities = [_]f64{
 
 const F64Vector = @Vector(simd_lane_count, f64);
 
+const LineCheck = enum {
+    bounded,
+    explicit,
+};
+
 comptime {
     std.debug.assert(quantile_count == quantile_probabilities.len);
     std.debug.assert(quantile_rank_max == quantile_count * 2);
@@ -102,13 +107,26 @@ pub fn parse(
 
     var reader: Io.Reader = .fixed(input);
 
-    return parse_reader(allocator, &reader, options) catch |err| switch (err) {
+    return parse_reader_inner(.bounded, allocator, &reader, options) catch |err| switch (err) {
         error.ReadFailed => unreachable,
         else => |parse_error| return parse_error,
     };
 }
 
 pub fn parse_reader(
+    allocator: std.mem.Allocator,
+    reader: *Io.Reader,
+    options: *const ParseOptions,
+) StreamParseError![]f64 {
+    if (reader.buffer.len < line_bytes_max) {
+        return parse_reader_inner(.bounded, allocator, reader, options);
+    }
+
+    return parse_reader_inner(.explicit, allocator, reader, options);
+}
+
+fn parse_reader_inner(
+    comptime line_check: LineCheck,
     allocator: std.mem.Allocator,
     reader: *Io.Reader,
     options: *const ParseOptions,
@@ -128,27 +146,48 @@ pub fn parse_reader(
     for (options.delimiters) |delimiter| {
         delimiters[delimiter] = true;
     }
+    // Treat CR as line framing even when callers replace field delimiters.
+    delimiters['\r'] = true;
 
     var long_line: Io.Writer.Allocating = .init(allocator);
     defer long_line.deinit();
 
-    while (true) {
-        const line = reader.takeDelimiter('\n') catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
-            error.StreamTooLong => {
-                const long = try read_long_line(reader, &long_line);
-                try parse_line(&values, allocator, long, options.column, &delimiters);
-                continue;
-            },
-        } orelse break;
-
-        try parse_line(&values, allocator, line, options.column, &delimiters);
-    }
+    // Fixed input is prevalidated; narrow readers enforce limits through capacity.
+    try read_values(line_check, &values, allocator, reader, options, &delimiters, &long_line);
     if (values.items.len == 0) {
         return error.NoData;
     }
 
     return try values.toOwnedSlice(allocator);
+}
+
+inline fn read_values(
+    comptime line_check: LineCheck,
+    values: *std.ArrayList(f64),
+    allocator: std.mem.Allocator,
+    reader: *Io.Reader,
+    options: *const ParseOptions,
+    delimiters: *const [byte_value_count]bool,
+    long_line: *Io.Writer.Allocating,
+) StreamParseError!void {
+    while (true) {
+        const line = reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+            error.StreamTooLong => {
+                const long = try read_long_line(reader, long_line);
+                try parse_line(values, allocator, long, options.column, delimiters);
+                continue;
+            },
+        } orelse break;
+
+        if (line_check == .explicit) {
+            if (line.len >= line_bytes_max) {
+                @branchHint(.unlikely);
+                return error.LineTooLong;
+            }
+        }
+        try parse_line(values, allocator, line, options.column, delimiters);
+    }
 }
 
 fn validate_lines(input: []const u8) ParseError!void {
@@ -367,7 +406,7 @@ fn finish_token(
         return null;
     }
 
-    return std.mem.trimEnd(u8, line[start..token_end], "\r");
+    return line[start..token_end];
 }
 
 const Extrema = struct {
@@ -905,6 +944,16 @@ test "parse columns delimiters and comments" {
     try std.testing.expectEqualSlices(f64, &.{ 1.5, 2.5 }, values);
 }
 
+test "parse CRLF blanks and missing columns" {
+    const input = "alpha,1\r\n\r\nmissing,\r\nbeta,2\r\n";
+    const options: ParseOptions = .{ .column = 2, .delimiters = "," };
+
+    const values = try parse(std.testing.allocator, input, &options);
+    defer std.testing.allocator.free(values);
+
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, values);
+}
+
 test "parse reader across buffer boundaries" {
     var buffer: [7]u8 = undefined;
     var reader: std.testing.Reader = .init(&buffer, &.{
@@ -930,6 +979,7 @@ test "reject lines beyond the operational limit" {
 
     var buffer: [64]u8 = undefined;
     var reader: std.testing.Reader = .init(&buffer, &.{.{ .buffer = input }});
+    var wide_reader: Io.Reader = .fixed(input);
 
     try std.testing.expectError(
         error.LineTooLong,
@@ -938,6 +988,10 @@ test "reject lines beyond the operational limit" {
     try std.testing.expectError(
         error.LineTooLong,
         parse_reader(std.testing.allocator, &reader.interface, &.{}),
+    );
+    try std.testing.expectError(
+        error.LineTooLong,
+        parse_reader(std.testing.allocator, &wide_reader, &.{}),
     );
 }
 

@@ -2,6 +2,8 @@
 
 Fast descriptive statistics in pure Zig. It is a graph-free descendant of
 [`ministat`](https://github.com/leahneukirchen/ministat).
+The command-line interface is supported; the internal Zig modules are not a
+public library API.
 
 ```sh
 zig build -Doptimize=ReleaseFast

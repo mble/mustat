@@ -54,3 +54,6 @@ jobs:
 
       - name: Run tests
         run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Run release tests
+        run: zig build test -Doptimize=ReleaseFast

@@ -16,6 +16,7 @@ jobs:
   audit:
     name: Audit GitHub Actions
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       actions: read # Inspect actions in this private repository.
       contents: read # Inspect workflow sources.

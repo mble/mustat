@@ -36,9 +36,6 @@ pub fn main(init: std.process.Init) !void {
     var output_buffer: [output_buffer_bytes]u8 = undefined;
     var output_file: Io.File.Writer = .init(.stdout(), init.io, &output_buffer);
     const writer = &output_file.interface;
-    defer writer.flush() catch |err| {
-        std.log.err("stdout: {s}", .{@errorName(err)});
-    };
 
     try writer.print("values: {d}\n", .{value_count});
     try writer.print("random:  {d:.3} ms\n", .{random_result.elapsed_ms});
@@ -49,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
         random_result.checksum + ordered_result.checksum +
             parse_result.checksum + copy_result.checksum,
     });
+    try writer.flush();
 }
 
 const BenchmarkResult = struct {
