@@ -15,27 +15,30 @@ pub fn main(init: std.process.Init) !void {
     const working = try init.gpa.alloc(f64, value_count);
     defer init.gpa.free(working);
 
-    fillRandom(source);
+    fill_random(source);
 
     const ordered = try init.gpa.dupe(f64, source);
     defer init.gpa.free(ordered);
     std.mem.sortUnstable(f64, ordered, {}, std.sort.asc(f64));
 
-    var input = try makeInput(init.gpa, source);
+    var input = try make_input(init.gpa, source);
     defer input.deinit();
 
     @memcpy(working, source);
-    _ = mustat.calculate(working);
+    var warmup: mustat.Stats = undefined;
+    mustat.calculate(working, &warmup);
 
-    const random_result = benchmarkCalculate(init.io, source, working);
-    const ordered_result = benchmarkCalculate(init.io, ordered, working);
-    const parse_result = try benchmarkParse(init.gpa, init.io, input.written());
-    const copy_result = benchmarkCopy(init.io, source, working);
+    const random_result = benchmark_calculate(init.io, source, working);
+    const ordered_result = benchmark_calculate(init.io, ordered, working);
+    const parse_result = try benchmark_parse(init.gpa, init.io, input.written());
+    const copy_result = benchmark_copy(init.io, source, working);
 
     var output_buffer: [output_buffer_bytes]u8 = undefined;
     var output_file: Io.File.Writer = .init(.stdout(), init.io, &output_buffer);
     const writer = &output_file.interface;
-    defer writer.flush() catch {};
+    defer writer.flush() catch |err| {
+        std.log.err("stdout: {s}", .{@errorName(err)});
+    };
 
     try writer.print("values: {d}\n", .{value_count});
     try writer.print("random:  {d:.3} ms\n", .{random_result.elapsed_ms});
@@ -53,7 +56,7 @@ const BenchmarkResult = struct {
     checksum: f64,
 };
 
-fn fillRandom(values: []f64) void {
+fn fill_random(values: []f64) void {
     var state = std.Random.DefaultPrng.init(random_seed);
     const random = state.random();
     for (values) |*value| {
@@ -61,7 +64,7 @@ fn fillRandom(values: []f64) void {
     }
 }
 
-fn makeInput(allocator: std.mem.Allocator, values: []const f64) !Io.Writer.Allocating {
+fn make_input(allocator: std.mem.Allocator, values: []const f64) !Io.Writer.Allocating {
     const bytes_per_value = u32_decimal_digits_max + 1;
     var input: Io.Writer.Allocating = try .initCapacity(
         allocator,
@@ -76,24 +79,31 @@ fn makeInput(allocator: std.mem.Allocator, values: []const f64) !Io.Writer.Alloc
     return input;
 }
 
-fn benchmarkCalculate(io: Io, source: []const f64, working: []f64) BenchmarkResult {
+fn benchmark_calculate(io: Io, source: []const f64, working: []f64) BenchmarkResult {
+    std.debug.assert(source.len == working.len);
+    std.debug.assert(source.len > repetition_count);
+
     var elapsed_ns: i96 = 0;
     var checksum: f64 = 0.0;
     for (0..repetition_count) |_| {
         @memcpy(working, source);
         const start = Io.Timestamp.now(io, .awake);
-        const stats = mustat.calculate(working);
+        var stats: mustat.Stats = undefined;
+        mustat.calculate(working, &stats);
         elapsed_ns += start.untilNow(io, .awake).nanoseconds;
         checksum += stats.median;
     }
 
     return .{
-        .elapsed_ms = averageMilliseconds(elapsed_ns),
+        .elapsed_ms = average_milliseconds(elapsed_ns),
         .checksum = checksum,
     };
 }
 
-fn benchmarkCopy(io: Io, source: []const f64, working: []f64) BenchmarkResult {
+fn benchmark_copy(io: Io, source: []const f64, working: []f64) BenchmarkResult {
+    std.debug.assert(source.len == working.len);
+    std.debug.assert(source.len > repetition_count);
+
     var elapsed_ns: i96 = 0;
     var checksum: f64 = 0.0;
     for (0..repetition_count) |_| {
@@ -104,12 +114,12 @@ fn benchmarkCopy(io: Io, source: []const f64, working: []f64) BenchmarkResult {
     }
 
     return .{
-        .elapsed_ms = averageMilliseconds(elapsed_ns),
+        .elapsed_ms = average_milliseconds(elapsed_ns),
         .checksum = checksum,
     };
 }
 
-fn benchmarkParse(
+fn benchmark_parse(
     allocator: std.mem.Allocator,
     io: Io,
     input: []const u8,
@@ -118,19 +128,23 @@ fn benchmarkParse(
     var checksum: f64 = 0.0;
     for (0..repetition_count) |_| {
         const start = Io.Timestamp.now(io, .awake);
-        const values = try mustat.parse(allocator, input, .{});
+        const options: mustat.ParseOptions = .{
+            .column = 1,
+            .delimiters = " \t",
+        };
+        const values = try mustat.parse(allocator, input, &options);
         elapsed_ns += start.untilNow(io, .awake).nanoseconds;
         checksum += values[repetition_count];
         allocator.free(values);
     }
 
     return .{
-        .elapsed_ms = averageMilliseconds(elapsed_ns),
+        .elapsed_ms = average_milliseconds(elapsed_ns),
         .checksum = checksum,
     };
 }
 
-fn averageMilliseconds(elapsed_ns: i96) f64 {
+fn average_milliseconds(elapsed_ns: i96) f64 {
     const nanoseconds_per_millisecond = std.time.ns_per_ms;
     const elapsed: f64 = @floatFromInt(elapsed_ns);
     const repetitions: f64 = @floatFromInt(repetition_count);

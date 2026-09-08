@@ -3,20 +3,50 @@ const std = @import("std");
 const Io = std.Io;
 
 const byte_value_count = 1 << @bitSizeOf(u8);
-const count_exact_max: u64 = 1 << 53;
+const kibibyte = 1024;
+const mebibyte = 1024 * kibibyte;
+const gibibyte = 1024 * mebibyte;
+const line_bytes_max = 1 * mebibyte;
+const value_storage_bytes_max: u64 = 4 * gibibyte;
+const addressable_value_count = std.math.maxInt(usize) / @sizeOf(f64);
+const stored_value_count: u64 = value_storage_bytes_max / @sizeOf(f64);
+const value_count_max: usize = @min(addressable_value_count, stored_value_count);
 const beta_epsilon = 3e-14;
 const beta_iteration_max = 200;
 const beta_min = 1e-300;
 const quantile_count = 6;
 const quantile_rank_max = quantile_count * 2;
+const q1_probability = 0.25;
+const median_probability = 0.50;
+const q3_probability = 0.75;
+const p90_probability = 0.90;
+const p95_probability = 0.95;
+const p99_probability = 0.99;
+const percent_scale = 100.0;
+const selection_depth_multiplier = 2;
 const selection_sort_threshold = 64;
 // Wide vectors hide accumulation latency on 128-bit and 256-bit SIMD.
 const simd_lane_count = 16;
 const order_increasing_mask: u2 = 1 << 0;
 const order_decreasing_mask: u2 = 1 << 1;
-const quantile_probabilities = [_]f64{ 0.25, 0.50, 0.75, 0.90, 0.95, 0.99 };
+const quantile_probabilities = [_]f64{
+    q1_probability,
+    median_probability,
+    q3_probability,
+    p90_probability,
+    p95_probability,
+    p99_probability,
+};
 
 const F64Vector = @Vector(simd_lane_count, f64);
+
+comptime {
+    std.debug.assert(quantile_count == quantile_probabilities.len);
+    std.debug.assert(quantile_rank_max == quantile_count * 2);
+    std.debug.assert(simd_lane_count > 0);
+    std.debug.assert(std.math.isPowerOfTwo(simd_lane_count));
+    std.debug.assert(value_count_max <= stored_value_count);
+}
 
 pub const ParseOptions = struct {
     column: usize = 1,
@@ -27,6 +57,7 @@ pub const ParseError = error{
     EmptyDelimiter,
     InvalidColumn,
     InvalidNumber,
+    LineTooLong,
     NoData,
     NonFiniteNumber,
     OutOfMemory,
@@ -36,7 +67,7 @@ pub const ParseError = error{
 pub const StreamParseError = ParseError || error{ReadFailed};
 
 pub const Stats = struct {
-    count: usize,
+    count: u64,
     min: f64,
     q1: f64,
     median: f64,
@@ -65,20 +96,22 @@ pub const TTest = struct {
 pub fn parse(
     allocator: std.mem.Allocator,
     input: []const u8,
-    options: ParseOptions,
+    options: *const ParseOptions,
 ) ParseError![]f64 {
+    try validate_lines(input);
+
     var reader: Io.Reader = .fixed(input);
 
-    return parseReader(allocator, &reader, options) catch |err| switch (err) {
+    return parse_reader(allocator, &reader, options) catch |err| switch (err) {
         error.ReadFailed => unreachable,
         else => |parse_error| return parse_error,
     };
 }
 
-pub fn parseReader(
+pub fn parse_reader(
     allocator: std.mem.Allocator,
     reader: *Io.Reader,
-    options: ParseOptions,
+    options: *const ParseOptions,
 ) StreamParseError![]f64 {
     if (options.column == 0) {
         return error.InvalidColumn;
@@ -103,25 +136,13 @@ pub fn parseReader(
         const line = reader.takeDelimiter('\n') catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
             error.StreamTooLong => {
-                // Allocate only for the rare line larger than the read buffer.
-                long_line.clearRetainingCapacity();
-                _ = reader.streamDelimiterEnding(&long_line.writer, '\n') catch |stream_error| {
-                    return switch (stream_error) {
-                        error.ReadFailed => error.ReadFailed,
-                        error.WriteFailed => error.OutOfMemory,
-                    };
-                };
-                if (reader.bufferedLen() != 0) {
-                    std.debug.assert(reader.buffered()[0] == '\n');
-                    reader.toss(1);
-                }
-
-                try parseLine(&values, allocator, long_line.written(), options, &delimiters);
+                const long = try read_long_line(reader, &long_line);
+                try parse_line(&values, allocator, long, options.column, &delimiters);
                 continue;
             },
         } orelse break;
 
-        try parseLine(&values, allocator, line, options, &delimiters);
+        try parse_line(&values, allocator, line, options.column, &delimiters);
     }
     if (values.items.len == 0) {
         return error.NoData;
@@ -130,37 +151,92 @@ pub fn parseReader(
     return try values.toOwnedSlice(allocator);
 }
 
-fn parseLine(
+fn validate_lines(input: []const u8) ParseError!void {
+    var line_start: usize = 0;
+    // Scan wide windows so fixed readers cannot bypass the streaming line cap.
+    while (input.len - line_start >= line_bytes_max) {
+        const window = input[line_start..][0..line_bytes_max];
+        const newline = std.mem.lastIndexOfScalar(u8, window, '\n') orelse {
+            return error.LineTooLong;
+        };
+
+        line_start += newline + 1;
+        std.debug.assert(line_start <= input.len);
+    }
+}
+
+fn read_long_line(
+    reader: *Io.Reader,
+    long_line: *Io.Writer.Allocating,
+) StreamParseError![]const u8 {
+    // Bound allocation while supporting lines larger than the read buffer.
+    long_line.clearRetainingCapacity();
+    _ = reader.streamDelimiterLimit(
+        &long_line.writer,
+        '\n',
+        .limited(line_bytes_max),
+    ) catch |stream_error| {
+        return switch (stream_error) {
+            error.ReadFailed => error.ReadFailed,
+            error.StreamTooLong => error.LineTooLong,
+            error.WriteFailed => error.OutOfMemory,
+        };
+    };
+    if (reader.bufferedLen() != 0) {
+        std.debug.assert(reader.buffered()[0] == '\n');
+        reader.toss(1);
+    }
+
+    std.debug.assert(long_line.written().len < line_bytes_max);
+    return long_line.written();
+}
+
+fn parse_line(
     values: *std.ArrayList(f64),
     allocator: std.mem.Allocator,
     line: []const u8,
-    options: ParseOptions,
+    column: usize,
     delimiters: *const [byte_value_count]bool,
 ) ParseError!void {
-    const token = findColumn(line, options.column, delimiters) orelse return;
+    const token = find_column(line, column, delimiters) orelse return;
     const value = std.fmt.parseFloat(f64, token) catch {
         return error.InvalidNumber;
     };
     if (std.math.isFinite(value) == false) {
         return error.NonFiniteNumber;
     }
-    if (@as(u64, @intCast(values.items.len)) == count_exact_max) {
-        return error.TooManyValues;
-    }
-
-    try values.append(allocator, value);
+    try append_value(values, allocator, value);
 }
 
-pub fn calculate(values: []f64) Stats {
-    std.debug.assert(values.len > 0);
-    std.debug.assert(@as(u64, @intCast(values.len)) <= count_exact_max);
+inline fn append_value(
+    values: *std.ArrayList(f64),
+    allocator: std.mem.Allocator,
+    value: f64,
+) ParseError!void {
+    if (values.items.len == values.capacity) {
+        if (values.items.len >= value_count_max) {
+            return error.TooManyValues;
+        }
 
-    const extrema = calculateExtrema(values);
-    const mean = calculateMean(values, &extrema);
-    const variance = calculateVariance(values, mean, &extrema);
+        // Clamp only cold growth to keep the per-value path branch-free.
+        const grown = std.ArrayList(f64).growCapacity(values.items.len + 1);
+        try values.ensureTotalCapacityPrecise(allocator, @min(grown, value_count_max));
+        std.debug.assert(values.capacity <= value_count_max);
+    }
+
+    values.appendAssumeCapacity(value);
+}
+
+pub fn calculate(values: []f64, stats: *Stats) void {
+    std.debug.assert(values.len > 0);
+    std.debug.assert(values.len <= value_count_max);
+
+    const extrema = calculate_extrema(values);
+    const mean = calculate_mean(values, &extrema);
+    const variance = calculate_variance(values, mean, &extrema);
     const stddev = if (variance) |value| @sqrt(value) else null;
     const stderr = if (stddev) |value| value / @sqrt(@as(f64, @floatFromInt(values.len))) else null;
-    const cv_percent = if (stddev) |value| calculateCv(value, mean) else null;
+    const cv_percent = if (stddev) |value| calculate_cv(value, mean) else null;
 
     switch (extrema.order) {
         .constant, .increasing => {},
@@ -168,19 +244,19 @@ pub fn calculate(values: []f64) Stats {
         .unsorted => {
             // Multi-selection resolves only the required order statistics.
             var rank_buffer: [quantile_rank_max]usize = undefined;
-            const rank_count = quantileRanks(values.len, &rank_buffer);
-            selectRanks(values, rank_buffer[0..rank_count]);
+            const rank_count = quantile_ranks(values.len, &rank_buffer);
+            select_ranks(values, rank_buffer[0..rank_count]);
         },
     }
 
-    const q1 = quantile(values, 0.25);
-    const q3 = quantile(values, 0.75);
+    const q1 = quantile(values, q1_probability);
+    const q3 = quantile(values, q3_probability);
 
-    return .{
-        .count = values.len,
+    stats.* = .{
+        .count = @intCast(values.len),
         .min = extrema.min,
         .q1 = q1,
-        .median = quantile(values, 0.50),
+        .median = quantile(values, median_probability),
         .q3 = q3,
         .max = extrema.max,
         .iqr = q3 - q1,
@@ -190,25 +266,28 @@ pub fn calculate(values: []f64) Stats {
         .stddev = stddev,
         .stderr = stderr,
         .cv_percent = cv_percent,
-        .p90 = quantile(values, 0.90),
-        .p95 = quantile(values, 0.95),
-        .p99 = quantile(values, 0.99),
+        .p90 = quantile(values, p90_probability),
+        .p95 = quantile(values, p95_probability),
+        .p99 = quantile(values, p99_probability),
     };
 }
 
-pub fn welch(left: *const Stats, right: *const Stats) ?TTest {
-    const left_variance = left.variance orelse return null;
-    const right_variance = right.variance orelse return null;
+pub fn welch(left: *const Stats, right: *const Stats, result: *TTest) bool {
+    const left_variance = left.variance orelse return false;
+    const right_variance = right.variance orelse return false;
+    std.debug.assert(left.count > 1);
+    std.debug.assert(right.count > 1);
+
     const left_count: f64 = @floatFromInt(left.count);
     const right_count: f64 = @floatFromInt(right.count);
     const left_scaled = left_variance / left_count;
     const right_scaled = right_variance / right_count;
     const variance_scale = @max(left_scaled, right_scaled);
     if (variance_scale == 0.0) {
-        return null;
+        return false;
     }
     if (std.math.isFinite(variance_scale) == false) {
-        return null;
+        return false;
     }
 
     const left_normalized = left_scaled / variance_scale;
@@ -220,7 +299,7 @@ pub fn welch(left: *const Stats, right: *const Stats) ?TTest {
     const freedom_denominator = left_normalized * left_normalized / left_freedom +
         right_normalized * right_normalized / right_freedom;
     if (freedom_denominator == 0.0) {
-        return null;
+        return false;
     }
 
     const difference = left.mean - right.mean;
@@ -230,18 +309,22 @@ pub fn welch(left: *const Stats, right: *const Stats) ?TTest {
     const relative_percent = if (right.mean == 0.0)
         null
     else
-        difference / @abs(right.mean) * 100.0;
+        difference / @abs(right.mean) * percent_scale;
 
-    return .{
+    const p_value = student_two_tail(@abs(statistic), freedom) orelse return false;
+    result.* = .{
         .difference = difference,
         .relative_percent = relative_percent,
         .statistic = statistic,
         .freedom = freedom,
-        .p_value = studentTwoTail(@abs(statistic), freedom),
+        .p_value = p_value,
     };
+    std.debug.assert(result.p_value >= 0.0);
+    std.debug.assert(result.p_value <= 1.0);
+    return true;
 }
 
-fn findColumn(
+fn find_column(
     line: []const u8,
     column_wanted: usize,
     delimiters: *const [byte_value_count]bool,
@@ -251,10 +334,10 @@ fn findColumn(
 
     for (line, 0..) |byte, index| {
         if (byte == '#') {
-            return finishToken(line, token_start, index, column, column_wanted);
+            return finish_token(line, token_start, index, column, column_wanted);
         }
         if (delimiters[byte]) {
-            const token = finishToken(line, token_start, index, column, column_wanted);
+            const token = finish_token(line, token_start, index, column, column_wanted);
             if (token != null) {
                 return token;
             }
@@ -269,10 +352,10 @@ fn findColumn(
         }
     }
 
-    return finishToken(line, token_start, line.len, column, column_wanted);
+    return finish_token(line, token_start, line.len, column, column_wanted);
 }
 
-fn finishToken(
+fn finish_token(
     line: []const u8,
     token_start: ?usize,
     token_end: usize,
@@ -300,7 +383,9 @@ const InputOrder = enum(u2) {
     constant = order_increasing_mask | order_decreasing_mask,
 };
 
-fn calculateExtrema(values: []const f64) Extrema {
+fn calculate_extrema(values: []const f64) Extrema {
+    std.debug.assert(values.len > 0);
+
     var minima: F64Vector = @splat(values[0]);
     var maxima: F64Vector = @splat(values[0]);
     var order_mask: u2 = @intFromEnum(InputOrder.constant);
@@ -329,28 +414,35 @@ fn calculateExtrema(values: []const f64) Extrema {
     for (values[index..]) |value| {
         result.min = @min(result.min, value);
         result.max = @max(result.max, value);
-        result.order = nextOrder(result.order, previous, value);
+        result.order = next_order(result.order, previous, value);
         previous = value;
     }
 
     return result;
 }
 
-fn nextOrder(order: InputOrder, previous: f64, value: f64) InputOrder {
+fn next_order(order: InputOrder, previous: f64, value: f64) InputOrder {
+    if (order == .constant) {
+        if (previous < value) {
+            return .increasing;
+        }
+        if (previous > value) {
+            return .decreasing;
+        }
+        return .constant;
+    }
+
     return switch (order) {
-        .constant => if (previous < value)
-            .increasing
-        else if (previous > value)
-            .decreasing
-        else
-            .constant,
+        .constant => unreachable,
         .increasing => if (previous <= value) .increasing else .unsorted,
         .decreasing => if (previous >= value) .decreasing else .unsorted,
         .unsorted => .unsorted,
     };
 }
 
-fn calculateMean(values: []const f64, extrema: *const Extrema) f64 {
+fn calculate_mean(values: []const f64, extrema: *const Extrema) f64 {
+    std.debug.assert(values.len > 0);
+
     const reference = interpolate(extrema.min, extrema.max, 0.5);
     const count: f64 = @floatFromInt(values.len);
     const references: F64Vector = @splat(reference);
@@ -387,7 +479,9 @@ fn calculateMean(values: []const f64, extrema: *const Extrema) f64 {
     return reference + total.value();
 }
 
-fn calculateVariance(values: []const f64, mean: f64, extrema: *const Extrema) ?f64 {
+fn calculate_variance(values: []const f64, mean: f64, extrema: *const Extrema) ?f64 {
+    std.debug.assert(values.len > 0);
+
     if (values.len < 2) {
         return null;
     }
@@ -444,12 +538,14 @@ const CompensatedSum = struct {
     }
 };
 
-fn calculateCv(stddev: f64, mean: f64) ?f64 {
+fn calculate_cv(stddev: f64, mean: f64) ?f64 {
+    std.debug.assert(stddev >= 0.0);
+
     if (mean == 0.0) {
         return null;
     }
 
-    return stddev / @abs(mean) * 100.0;
+    return stddev / @abs(mean) * percent_scale;
 }
 
 fn quantile(values: []const f64, probability: f64) f64 {
@@ -467,7 +563,9 @@ fn quantile(values: []const f64, probability: f64) f64 {
     return interpolate(values[lower], values[upper], fraction);
 }
 
-fn quantileRanks(count: usize, ranks: *[quantile_rank_max]usize) usize {
+fn quantile_ranks(count: usize, ranks: *[quantile_rank_max]usize) usize {
+    std.debug.assert(count > 0);
+
     const span: f64 = @floatFromInt(count - 1);
     var rank_count: usize = 0;
     for (quantile_probabilities) |probability| {
@@ -492,37 +590,112 @@ fn quantileRanks(count: usize, ranks: *[quantile_rank_max]usize) usize {
     return unique_count;
 }
 
-fn selectRanks(values: []f64, ranks: []const usize) void {
-    std.debug.assert(ranks.len > 0);
-    std.debug.assert(ranks[ranks.len - 1] < values.len);
+const SelectionTask = struct {
+    rank_start: usize,
+    rank_end: usize,
+    value_start: usize,
+    value_end: usize,
+    depth: usize,
+};
 
-    const depth_max = 2 * (@as(usize, std.math.log2_int(usize, values.len)) + 1);
-    selectRange(values, ranks, 0, values.len, depth_max);
+fn select_ranks(values: []f64, ranks: []const usize) void {
+    std.debug.assert(ranks.len > 0);
+    std.debug.assert(ranks.len <= quantile_rank_max);
+    std.debug.assert(ranks[ranks.len - 1] < values.len);
+    for (ranks[1..], ranks[0 .. ranks.len - 1]) |rank, previous| {
+        std.debug.assert(previous < rank);
+    }
+
+    const depth_max = selection_depth_multiplier *
+        (@as(usize, std.math.log2_int(usize, values.len)) + 1);
+    var tasks: [quantile_rank_max]SelectionTask = undefined;
+    tasks[0] = .{
+        .rank_start = 0,
+        .rank_end = ranks.len,
+        .value_start = 0,
+        .value_end = values.len,
+        .depth = depth_max,
+    };
+    var task_count: usize = 1;
+    var iterations_remaining = ranks.len * (depth_max + 1);
+
+    // Each task owns at least one rank, bounding the explicit work stack.
+    while (iterations_remaining > 0) : (iterations_remaining -= 1) {
+        if (task_count == 0) {
+            return;
+        }
+
+        task_count -= 1;
+        const task = tasks[task_count];
+        select_task(values, ranks, &tasks, &task_count, &task);
+    }
+
+    std.debug.assert(task_count == 0);
 }
 
-fn selectRange(
+inline fn select_task(
     values: []f64,
     ranks: []const usize,
-    start: usize,
-    end: usize,
-    depth: usize,
+    tasks: *[quantile_rank_max]SelectionTask,
+    task_count: *usize,
+    task: *const SelectionTask,
 ) void {
-    if (ranks.len == 0) {
+    std.debug.assert(task.rank_start < task.rank_end);
+    std.debug.assert(task.value_start < task.value_end);
+    std.debug.assert(task.rank_end <= ranks.len);
+    std.debug.assert(task.value_end <= values.len);
+
+    const task_ranks = ranks[task.rank_start..task.rank_end];
+    if (task.value_end - task.value_start <= selection_sort_threshold) {
+        std.mem.sortUnstable(f64, values[task.value_start..task.value_end], {}, std.sort.asc(f64));
         return;
     }
-    if (end - start <= selection_sort_threshold or depth == 0) {
-        std.mem.sortUnstable(f64, values[start..end], {}, std.sort.asc(f64));
+    if (task.depth == 0) {
+        std.mem.sortUnstable(f64, values[task.value_start..task.value_end], {}, std.sort.asc(f64));
         return;
     }
 
-    const middle = start + @divFloor(end - start, 2);
-    const pivot = medianOfThree(values[start], values[middle], values[end - 1]);
-    const equal = partition(values, start, end, pivot);
-    const left_count = rankLowerBound(ranks, equal.start);
-    const right_start = rankLowerBound(ranks, equal.end);
+    const middle = task.value_start + @divFloor(task.value_end - task.value_start, 2);
+    const pivot = median_of_three(
+        values[task.value_start],
+        values[middle],
+        values[task.value_end - 1],
+    );
+    const equal = partition(values, task.value_start, task.value_end, pivot);
+    const left_count = rank_lower_bound(task_ranks, equal.start);
+    const right_start = rank_lower_bound(task_ranks, equal.end);
 
-    selectRange(values, ranks[0..left_count], start, equal.start, depth - 1);
-    selectRange(values, ranks[right_start..], equal.end, end, depth - 1);
+    if (right_start < task_ranks.len) {
+        const right: SelectionTask = .{
+            .rank_start = task.rank_start + right_start,
+            .rank_end = task.rank_end,
+            .value_start = equal.end,
+            .value_end = task.value_end,
+            .depth = task.depth - 1,
+        };
+        push_task(tasks, task_count, &right);
+    }
+    if (left_count > 0) {
+        const left: SelectionTask = .{
+            .rank_start = task.rank_start,
+            .rank_end = task.rank_start + left_count,
+            .value_start = task.value_start,
+            .value_end = equal.start,
+            .depth = task.depth - 1,
+        };
+        push_task(tasks, task_count, &left);
+    }
+}
+
+inline fn push_task(
+    tasks: *[quantile_rank_max]SelectionTask,
+    task_count: *usize,
+    task: *const SelectionTask,
+) void {
+    std.debug.assert(task_count.* < tasks.len);
+
+    tasks[task_count.*] = task.*;
+    task_count.* += 1;
 }
 
 const EqualRange = struct {
@@ -531,7 +704,10 @@ const EqualRange = struct {
 };
 
 fn partition(values: []f64, start: usize, end: usize, pivot: f64) EqualRange {
-    const pivot_index = findPivot(values, start, end, pivot);
+    std.debug.assert(start < end);
+    std.debug.assert(end <= values.len);
+
+    const pivot_index = find_pivot(values, start, end, pivot);
     std.mem.swap(f64, &values[pivot_index], &values[end - 1]);
 
     var lower = start;
@@ -566,7 +742,10 @@ fn partition(values: []f64, start: usize, end: usize, pivot: f64) EqualRange {
     return .{ .start = lower, .end = upper };
 }
 
-fn findPivot(values: []const f64, start: usize, end: usize, pivot: f64) usize {
+fn find_pivot(values: []const f64, start: usize, end: usize, pivot: f64) usize {
+    std.debug.assert(start < end);
+    std.debug.assert(end <= values.len);
+
     if (values[start] == pivot) {
         return start;
     }
@@ -580,7 +759,7 @@ fn findPivot(values: []const f64, start: usize, end: usize, pivot: f64) usize {
     return end - 1;
 }
 
-fn medianOfThree(first_value: f64, second_value: f64, third_value: f64) f64 {
+fn median_of_three(first_value: f64, second_value: f64, third_value: f64) f64 {
     var first = first_value;
     var second = second_value;
     var third = third_value;
@@ -597,7 +776,7 @@ fn medianOfThree(first_value: f64, second_value: f64, third_value: f64) f64 {
     return second;
 }
 
-fn rankLowerBound(ranks: []const usize, target: usize) usize {
+fn rank_lower_bound(ranks: []const usize, target: usize) usize {
     var start: usize = 0;
     var end = ranks.len;
     while (start < end) {
@@ -621,17 +800,23 @@ fn interpolate(lower: f64, upper: f64, fraction: f64) f64 {
     return lower + (upper - lower) * fraction;
 }
 
-fn studentTwoTail(statistic: f64, freedom: f64) f64 {
+fn student_two_tail(statistic: f64, freedom: f64) ?f64 {
     std.debug.assert(statistic >= 0.0);
     std.debug.assert(freedom > 0.0);
+    if (std.math.isFinite(statistic) == false) {
+        return 0.0;
+    }
+    if (std.math.isFinite(freedom) == false) {
+        return null;
+    }
 
     const statistic_squared = statistic * statistic;
     const beta_x = freedom / (freedom + statistic_squared);
 
-    return regularizedBeta(beta_x, freedom / 2.0, 0.5);
+    return regularized_beta(beta_x, freedom / 2.0, 0.5);
 }
 
-fn regularizedBeta(x: f64, a: f64, b: f64) f64 {
+fn regularized_beta(x: f64, a: f64, b: f64) ?f64 {
     std.debug.assert(x >= 0.0);
     std.debug.assert(x <= 1.0);
     std.debug.assert(a > 0.0);
@@ -648,18 +833,23 @@ fn regularizedBeta(x: f64, a: f64, b: f64) f64 {
         std.math.lgamma(f64, a) - std.math.lgamma(f64, b);
     const factor = @exp(log_beta + a * @log(x) + b * std.math.log1p(-x));
     if (x < (a + 1.0) / (a + b + 2.0)) {
-        return factor * betaFraction(a, b, x) / a;
+        const fraction = beta_fraction(a, b, x) orelse return null;
+        return factor * fraction / a;
     }
 
-    return 1.0 - factor * betaFraction(b, a, 1.0 - x) / b;
+    const fraction = beta_fraction(b, a, 1.0 - x) orelse return null;
+    return 1.0 - factor * fraction / b;
 }
 
-fn betaFraction(a: f64, b: f64, x: f64) f64 {
+fn beta_fraction(a: f64, b: f64, x: f64) ?f64 {
+    std.debug.assert(a > 0.0);
+    std.debug.assert(b > 0.0);
+
     const sum = a + b;
     const a_next = a + 1.0;
     const a_previous = a - 1.0;
     var c: f64 = 1.0;
-    var d = clampBeta(1.0 - sum * x / a_next);
+    var d = clamp_beta(1.0 - sum * x / a_next);
     d = 1.0 / d;
     var result = d;
 
@@ -669,25 +859,26 @@ fn betaFraction(a: f64, b: f64, x: f64) f64 {
         const twice = 2.0 * index;
         var coefficient = index * (b - index) * x /
             ((a_previous + twice) * (a + twice));
-        d = 1.0 / clampBeta(1.0 + coefficient * d);
-        c = clampBeta(1.0 + coefficient / c);
+        d = 1.0 / clamp_beta(1.0 + coefficient * d);
+        c = clamp_beta(1.0 + coefficient / c);
         result *= d * c;
 
         coefficient = -(a + index) * (sum + index) * x /
             ((a + twice) * (a_next + twice));
-        d = 1.0 / clampBeta(1.0 + coefficient * d);
-        c = clampBeta(1.0 + coefficient / c);
+        d = 1.0 / clamp_beta(1.0 + coefficient * d);
+        c = clamp_beta(1.0 + coefficient / c);
         const delta = d * c;
         result *= delta;
         if (@abs(delta - 1.0) <= beta_epsilon) {
-            break;
+            return result;
         }
     }
 
-    return result;
+    // A bounded failure is safer than emitting an unstable probability.
+    return null;
 }
 
-fn clampBeta(value: f64) f64 {
+fn clamp_beta(value: f64) f64 {
     if (@abs(value) >= beta_min) {
         return value;
     }
@@ -708,7 +899,7 @@ test "parse columns delimiters and comments" {
     ;
     const options: ParseOptions = .{ .column = 2, .delimiters = ", \t" };
 
-    const values = try parse(std.testing.allocator, input, options);
+    const values = try parse(std.testing.allocator, input, &options);
     defer std.testing.allocator.free(values);
 
     try std.testing.expectEqualSlices(f64, &.{ 1.5, 2.5 }, values);
@@ -722,32 +913,51 @@ test "parse reader across buffer boundaries" {
     });
     reader.artificial_limit = .limited(3);
 
-    const values = try parseReader(
+    const values = try parse_reader(
         std.testing.allocator,
         &reader.interface,
-        .{ .column = 2, .delimiters = ", \t" },
+        &.{ .column = 2, .delimiters = ", \t" },
     );
     defer std.testing.allocator.free(values);
 
     try std.testing.expectEqualSlices(f64, &.{ 1.5, 2.5 }, values);
 }
 
+test "reject lines beyond the operational limit" {
+    const input = try std.testing.allocator.alloc(u8, line_bytes_max + 1);
+    defer std.testing.allocator.free(input);
+    @memset(input, ' ');
+
+    var buffer: [64]u8 = undefined;
+    var reader: std.testing.Reader = .init(&buffer, &.{.{ .buffer = input }});
+
+    try std.testing.expectError(
+        error.LineTooLong,
+        parse(std.testing.allocator, input, &.{}),
+    );
+    try std.testing.expectError(
+        error.LineTooLong,
+        parse_reader(std.testing.allocator, &reader.interface, &.{}),
+    );
+}
+
 test "reject invalid and non-finite selected values" {
     try std.testing.expectError(
         error.InvalidNumber,
-        parse(std.testing.allocator, "1\nnope\n", .{}),
+        parse(std.testing.allocator, "1\nnope\n", &.{}),
     );
     try std.testing.expectError(
         error.NonFiniteNumber,
-        parse(std.testing.allocator, "1\nnan\n", .{}),
+        parse(std.testing.allocator, "1\nnan\n", &.{}),
     );
 }
 
 test "calculate linear quantiles and sample dispersion" {
     var values = [_]f64{ 8, 2, 6, 4, 1, 7, 3, 5 };
-    const stats = calculate(&values);
+    var stats: Stats = undefined;
+    calculate(&values, &stats);
 
-    try std.testing.expectEqual(@as(usize, 8), stats.count);
+    try std.testing.expectEqual(@as(u64, 8), stats.count);
     try std.testing.expectApproxEqAbs(1.0, stats.min, 1e-12);
     try std.testing.expectApproxEqAbs(2.75, stats.q1, 1e-12);
     try std.testing.expectApproxEqAbs(4.5, stats.median, 1e-12);
@@ -763,7 +973,8 @@ test "calculate linear quantiles and sample dispersion" {
 
 test "single value has undefined sample dispersion" {
     var values = [_]f64{42};
-    const stats = calculate(&values);
+    var stats: Stats = undefined;
+    calculate(&values, &stats);
 
     try std.testing.expectEqual(@as(?f64, null), stats.variance);
     try std.testing.expectEqual(@as(?f64, null), stats.stddev);
@@ -773,7 +984,8 @@ test "single value has undefined sample dispersion" {
 
 test "constant values have zero dispersion" {
     var values = [_]f64{ 3, 3, 3, 3 };
-    const stats = calculate(&values);
+    var stats: Stats = undefined;
+    calculate(&values, &stats);
 
     try std.testing.expectEqual(@as(?f64, 0.0), stats.variance);
     try std.testing.expectEqual(@as(?f64, 0.0), stats.stddev);
@@ -782,14 +994,16 @@ test "constant values have zero dispersion" {
 
 test "opposite finite extremes have a finite median" {
     var values = [_]f64{ -std.math.floatMax(f64), std.math.floatMax(f64) };
-    const stats = calculate(&values);
+    var stats: Stats = undefined;
+    calculate(&values, &stats);
 
     try std.testing.expectEqual(@as(f64, 0.0), stats.median);
 }
 
 test "mean retains a small term amid cancellation" {
     var values = [_]f64{ -1e16, 1.0, 1e16 };
-    const stats = calculate(&values);
+    var stats: Stats = undefined;
+    calculate(&values, &stats);
 
     try std.testing.expectApproxEqAbs(1.0 / 3.0, stats.mean, 1e-15);
 }
@@ -797,10 +1011,13 @@ test "mean retains a small term amid cancellation" {
 test "Welch test matches NIST instrument example" {
     var left_values = [_]f64{ 91, 95, 107, 105, 102, 85, 88, 92, 101, 99, 102, 85, 114, 91, 95 };
     var right_values = [_]f64{ 93, 99, 97, 101, 70, 83, 97, 100, 91, 73, 90, 86, 95, 70, 87 };
-    const left = calculate(&left_values);
-    const right = calculate(&right_values);
+    var left: Stats = undefined;
+    var right: Stats = undefined;
+    calculate(&left_values, &left);
+    calculate(&right_values, &right);
 
-    const result = welch(&left, &right).?;
+    var result: TTest = undefined;
+    try std.testing.expect(welch(&left, &right, &result));
 
     try std.testing.expectApproxEqAbs(8.0, result.difference, 1e-12);
     try std.testing.expectApproxEqAbs(2.2855810195691872, result.statistic, 1e-12);
@@ -809,20 +1026,20 @@ test "Welch test matches NIST instrument example" {
 }
 
 test "Student two-tailed probabilities match known values" {
-    try std.testing.expectApproxEqAbs(0.5, studentTwoTail(1.0, 1.0), 1e-13);
+    try std.testing.expectApproxEqAbs(0.5, student_two_tail(1.0, 1.0).?, 1e-13);
     try std.testing.expectApproxEqAbs(
         0.2928932188134525,
-        studentTwoTail(@sqrt(2.0), 2.0),
+        student_two_tail(@sqrt(2.0), 2.0).?,
         1e-13,
     );
-    try std.testing.expectApproxEqAbs(0.05, studentTwoTail(12.7062047364, 1.0), 2e-7);
-    try std.testing.expectApproxEqAbs(0.05, studentTwoTail(2.228138852, 10.0), 2e-9);
+    try std.testing.expectApproxEqAbs(0.05, student_two_tail(12.7062047364, 1.0).?, 2e-7);
+    try std.testing.expectApproxEqAbs(0.05, student_two_tail(2.228138852, 10.0).?, 2e-9);
 }
 
 test "Student probability converges to normal for large samples" {
     try std.testing.expectApproxEqAbs(
         0.0499957903,
-        studentTwoTail(1.96, 1e9),
+        student_two_tail(1.96, 1e9).?,
         5e-8,
     );
 }
@@ -830,10 +1047,13 @@ test "Student probability converges to normal for large samples" {
 test "Welch test requires sample variance" {
     var left_values = [_]f64{1};
     var right_values = [_]f64{ 1, 2 };
-    const left = calculate(&left_values);
-    const right = calculate(&right_values);
+    var left: Stats = undefined;
+    var right: Stats = undefined;
+    calculate(&left_values, &left);
+    calculate(&right_values, &right);
 
-    try std.testing.expectEqual(@as(?TTest, null), welch(&left, &right));
+    var result: TTest = undefined;
+    try std.testing.expect(welch(&left, &right, &result) == false);
 }
 
 test "multi-selection matches full sorting" {
@@ -849,13 +1069,17 @@ test "multi-selection matches full sorting" {
         @memcpy(expected[0..count], values[0..count]);
         std.mem.sortUnstable(f64, expected[0..count], {}, std.sort.asc(f64));
 
-        const stats = calculate(values[0..count]);
-        try std.testing.expectEqual(quantile(expected[0..count], 0.25), stats.q1);
-        try std.testing.expectEqual(quantile(expected[0..count], 0.50), stats.median);
-        try std.testing.expectEqual(quantile(expected[0..count], 0.75), stats.q3);
-        try std.testing.expectEqual(quantile(expected[0..count], 0.90), stats.p90);
-        try std.testing.expectEqual(quantile(expected[0..count], 0.95), stats.p95);
-        try std.testing.expectEqual(quantile(expected[0..count], 0.99), stats.p99);
+        var stats: Stats = undefined;
+        calculate(values[0..count], &stats);
+        try std.testing.expectEqual(quantile(expected[0..count], q1_probability), stats.q1);
+        try std.testing.expectEqual(
+            quantile(expected[0..count], median_probability),
+            stats.median,
+        );
+        try std.testing.expectEqual(quantile(expected[0..count], q3_probability), stats.q3);
+        try std.testing.expectEqual(quantile(expected[0..count], p90_probability), stats.p90);
+        try std.testing.expectEqual(quantile(expected[0..count], p95_probability), stats.p95);
+        try std.testing.expectEqual(quantile(expected[0..count], p99_probability), stats.p99);
     }
 }
 
@@ -865,7 +1089,8 @@ test "descending SIMD path preserves order statistics" {
         value.* = @floatFromInt(values.len - index);
     }
 
-    const stats = calculate(&values);
+    var stats: Stats = undefined;
+    calculate(&values, &stats);
 
     try std.testing.expectEqual(1.0, stats.min);
     try std.testing.expectEqual(65.0, stats.q1);

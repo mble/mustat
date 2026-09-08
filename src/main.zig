@@ -9,6 +9,7 @@ const number_buffer_bytes = 64;
 const number_width = 13;
 const version = "0.1.0";
 const confidence_default = 95.0;
+const percent_scale = 100.0;
 const human_significant_digits = 8;
 const human_scientific_min = 1e-4;
 const human_scientific_max = 1e9;
@@ -31,6 +32,11 @@ const Percentiles = enum {
 const TestOutput = enum {
     enabled,
     disabled,
+};
+
+const ParseResult = enum {
+    run,
+    exit,
 };
 
 const Options = struct {
@@ -60,22 +66,29 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [output_buffer_bytes]u8 = undefined;
     var stdout_file: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file.interface;
-    defer stdout.flush() catch {};
+    defer stdout.flush() catch |err| {
+        std.log.err("stdout: {s}", .{@errorName(err)});
+    };
 
-    const options = parseArgs(arena, arguments[1..], stdout) catch |err| {
+    var options: Options = .{};
+    const parse_result = parse_args(arena, arguments[1..], stdout, &options) catch |err| {
         try usage(stdout);
         return err;
-    } orelse return;
+    };
+    if (parse_result == .exit) {
+        return;
+    }
 
     const paths: []const []const u8 = if (options.files.len == 0) &.{"-"} else options.files;
-    var baseline: ?mustat.Stats = null;
+    var baseline: mustat.Stats = undefined;
     var baseline_name: []const u8 = undefined;
+    var baseline_set = false;
     for (paths) |path| {
         const is_stdin = std.mem.eql(u8, path, "-");
         const file = if (is_stdin)
             Io.File.stdin()
         else
-            try Io.Dir.cwd().openFile(init.io, path, .{});
+            try Io.Dir.cwd().openFile(init.io, path, .{ .mode = .read_only });
         defer {
             if (is_stdin == false) {
                 file.close(init.io);
@@ -87,15 +100,16 @@ pub fn main(init: std.process.Init) !void {
 
         const name = if (is_stdin) "<stdin>" else path;
 
-        const stats = try report(init.gpa, stdout, name, &input_file.interface, &options);
-        if (baseline) |reference| {
+        var stats: mustat.Stats = undefined;
+        try report(init.gpa, stdout, name, &input_file.interface, &options, &stats);
+        if (baseline_set) {
             if (options.test_output == .enabled) {
-                try printTest(
+                try print_test(
                     stdout,
                     name,
                     &stats,
                     baseline_name,
-                    &reference,
+                    &baseline,
                     options.confidence,
                     options.number_format,
                 );
@@ -105,15 +119,16 @@ pub fn main(init: std.process.Init) !void {
 
         baseline = stats;
         baseline_name = name;
+        baseline_set = true;
     }
 }
 
-fn parseArgs(
+fn parse_args(
     allocator: std.mem.Allocator,
     arguments: []const []const u8,
     stdout: *Io.Writer,
-) (CliError || Io.Writer.Error)!?Options {
-    var options: Options = .{};
+    options: *Options,
+) (CliError || Io.Writer.Error)!ParseResult {
     var files: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
 
@@ -125,25 +140,25 @@ fn parseArgs(
         }
         if (std.mem.eql(u8, argument, "--help")) {
             try usage(stdout);
-            return null;
+            return .exit;
         }
         if (std.mem.eql(u8, argument, "--version")) {
             try stdout.print("mustat {s}\n", .{version});
-            return null;
+            return .exit;
         }
-        if (std.mem.eql(u8, argument, "-q") or std.mem.eql(u8, argument, "--quiet")) {
+        if (option_matches(argument, "-q", "--quiet")) {
             options.quiet = true;
             continue;
         }
-        if (std.mem.eql(u8, argument, "-h") or std.mem.eql(u8, argument, "--human")) {
+        if (option_matches(argument, "-h", "--human")) {
             options.number_format = .human;
             continue;
         }
-        if (std.mem.eql(u8, argument, "-p") or std.mem.eql(u8, argument, "--percentiles")) {
+        if (option_matches(argument, "-p", "--percentiles")) {
             options.percentiles = .included;
             continue;
         }
-        if (std.mem.eql(u8, argument, "-x") or std.mem.eql(u8, argument, "--extended")) {
+        if (option_matches(argument, "-x", "--extended")) {
             options.summary = .extended;
             continue;
         }
@@ -154,30 +169,40 @@ fn parseArgs(
             options.test_output = .disabled;
             continue;
         }
-        if (std.mem.eql(u8, argument, "-C") or std.mem.eql(u8, argument, "--column")) {
-            options.column = try parseColumn(try nextArgument(arguments, &index));
+        if (option_matches(argument, "-C", "--column")) {
+            options.column = try parse_column(try next_argument(arguments, &index));
             continue;
         }
-        if (std.mem.eql(u8, argument, "-d") or std.mem.eql(u8, argument, "--delimiters")) {
-            options.delimiters = try nextArgument(arguments, &index);
+        if (option_matches(argument, "-d", "--delimiters")) {
+            options.delimiters = try next_argument(arguments, &index);
             continue;
         }
-        if (std.mem.eql(u8, argument, "-c") or std.mem.eql(u8, argument, "--confidence")) {
-            options.confidence = try parseConfidence(try nextArgument(arguments, &index));
+        if (option_matches(argument, "-c", "--confidence")) {
+            options.confidence = try parse_confidence(try next_argument(arguments, &index));
             continue;
         }
-        if (argument.len > 1 and argument[0] == '-') {
-            return error.UnknownOption;
+        if (argument.len > 1) {
+            if (argument[0] == '-') {
+                return error.UnknownOption;
+            }
         }
 
         try files.append(allocator, argument);
     }
 
     options.files = try files.toOwnedSlice(allocator);
-    return options;
+    return .run;
 }
 
-fn nextArgument(arguments: []const []const u8, index: *usize) CliError![]const u8 {
+fn option_matches(argument: []const u8, short: []const u8, long: []const u8) bool {
+    if (std.mem.eql(u8, argument, short)) {
+        return true;
+    }
+
+    return std.mem.eql(u8, argument, long);
+}
+
+fn next_argument(arguments: []const []const u8, index: *usize) CliError![]const u8 {
     index.* += 1;
     if (index.* == arguments.len) {
         return error.MissingOptionValue;
@@ -186,7 +211,7 @@ fn nextArgument(arguments: []const []const u8, index: *usize) CliError![]const u
     return arguments[index.*];
 }
 
-fn parseColumn(argument: []const u8) CliError!usize {
+fn parse_column(argument: []const u8) CliError!usize {
     const column = std.fmt.parseInt(usize, argument, 10) catch {
         return error.InvalidColumn;
     };
@@ -197,7 +222,7 @@ fn parseColumn(argument: []const u8) CliError!usize {
     return column;
 }
 
-fn parseConfidence(argument: []const u8) CliError!f64 {
+fn parse_confidence(argument: []const u8) CliError!f64 {
     const confidence = std.fmt.parseFloat(f64, argument) catch {
         return error.InvalidConfidence;
     };
@@ -207,42 +232,42 @@ fn parseConfidence(argument: []const u8) CliError!f64 {
     if (confidence <= 0.0) {
         return error.InvalidConfidence;
     }
-    if (confidence >= 100.0) {
+    if (confidence >= percent_scale) {
         return error.InvalidConfidence;
     }
 
     return confidence;
 }
 
-fn report(
+inline fn report(
     allocator: std.mem.Allocator,
     writer: *Io.Writer,
     name: []const u8,
     reader: *Io.Reader,
     options: *const Options,
-) !mustat.Stats {
-    const values = mustat.parseReader(allocator, reader, .{
+    stats: *mustat.Stats,
+) !void {
+    const parse_options: mustat.ParseOptions = .{
         .column = options.column,
         .delimiters = options.delimiters,
-    }) catch |err| {
+    };
+    const values = mustat.parse_reader(allocator, reader, &parse_options) catch |err| {
         std.log.err("{s}: {s}", .{ name, @errorName(err) });
         return err;
     };
     defer allocator.free(values);
 
-    const stats = mustat.calculate(values);
+    mustat.calculate(values, stats);
 
     if (options.quiet == false) {
         try writer.print("{s}\n", .{name});
-        try printHeader(writer, options);
+        try print_header(writer, options);
     }
 
-    try printStats(writer, &stats, options);
-
-    return stats;
+    try print_stats(writer, stats, options);
 }
 
-fn printHeader(writer: *Io.Writer, options: *const Options) Io.Writer.Error!void {
+fn print_header(writer: *Io.Writer, options: *const Options) Io.Writer.Error!void {
     if (options.summary == .standard) {
         try writer.writeAll("       N           Min           Max        Median           Avg");
         try writer.writeAll("        Stddev");
@@ -257,39 +282,39 @@ fn printHeader(writer: *Io.Writer, options: *const Options) Io.Writer.Error!void
     try writer.writeByte('\n');
 }
 
-fn printStats(
+fn print_stats(
     writer: *Io.Writer,
     stats: *const mustat.Stats,
     options: *const Options,
 ) Io.Writer.Error!void {
     try writer.print("{d:>8}", .{stats.count});
     if (options.summary == .standard) {
-        try printNumber(writer, stats.min, options.number_format);
-        try printNumber(writer, stats.max, options.number_format);
-        try printNumber(writer, stats.median, options.number_format);
-        try printNumber(writer, stats.mean, options.number_format);
-        try printOptional(writer, stats.stddev, options.number_format);
+        try print_number(writer, stats.min, options.number_format);
+        try print_number(writer, stats.max, options.number_format);
+        try print_number(writer, stats.median, options.number_format);
+        try print_number(writer, stats.mean, options.number_format);
+        try print_optional(writer, stats.stddev, options.number_format);
     } else {
-        try printNumber(writer, stats.min, options.number_format);
-        try printNumber(writer, stats.q1, options.number_format);
-        try printNumber(writer, stats.median, options.number_format);
-        try printNumber(writer, stats.q3, options.number_format);
-        try printNumber(writer, stats.max, options.number_format);
-        try printNumber(writer, stats.iqr, options.number_format);
-        try printNumber(writer, stats.mean, options.number_format);
-        try printOptional(writer, stats.stddev, options.number_format);
-        try printOptional(writer, stats.stderr, options.number_format);
-        try printOptional(writer, stats.cv_percent, options.number_format);
+        try print_number(writer, stats.min, options.number_format);
+        try print_number(writer, stats.q1, options.number_format);
+        try print_number(writer, stats.median, options.number_format);
+        try print_number(writer, stats.q3, options.number_format);
+        try print_number(writer, stats.max, options.number_format);
+        try print_number(writer, stats.iqr, options.number_format);
+        try print_number(writer, stats.mean, options.number_format);
+        try print_optional(writer, stats.stddev, options.number_format);
+        try print_optional(writer, stats.stderr, options.number_format);
+        try print_optional(writer, stats.cv_percent, options.number_format);
     }
     if (options.percentiles == .included) {
-        try printNumber(writer, stats.p90, options.number_format);
-        try printNumber(writer, stats.p95, options.number_format);
-        try printNumber(writer, stats.p99, options.number_format);
+        try print_number(writer, stats.p90, options.number_format);
+        try print_number(writer, stats.p95, options.number_format);
+        try print_number(writer, stats.p99, options.number_format);
     }
     try writer.writeByte('\n');
 }
 
-fn printTest(
+fn print_test(
     writer: *Io.Writer,
     name: []const u8,
     stats: *const mustat.Stats,
@@ -298,66 +323,67 @@ fn printTest(
     confidence: f64,
     number_format: NumberFormat,
 ) Io.Writer.Error!void {
-    const result = mustat.welch(stats, baseline) orelse {
+    var result: mustat.TTest = undefined;
+    if (mustat.welch(stats, baseline, &result) == false) {
         try writer.print("Welch t-test {s} vs {s}: unavailable\n", .{ name, baseline_name });
         return;
-    };
-    const alpha = 1.0 - confidence / 100.0;
+    }
+    const alpha = 1.0 - confidence / percent_scale;
     const conclusion = if (result.p_value < alpha) "difference" else "no difference";
 
     try writer.print("Welch t-test {s} vs {s}:\n", .{ name, baseline_name });
     try writer.writeAll("  delta=");
-    try printCompact(writer, result.difference, number_format);
+    try print_compact(writer, result.difference, number_format);
     if (result.relative_percent) |relative| {
         try writer.writeAll(" (");
-        try printCompact(writer, relative, number_format);
+        try print_compact(writer, relative, number_format);
         try writer.writeAll("%)");
     }
     try writer.writeAll(", t=");
-    try printCompact(writer, result.statistic, number_format);
+    try print_compact(writer, result.statistic, number_format);
     try writer.writeAll(", df=");
-    try printCompact(writer, result.freedom, number_format);
+    try print_compact(writer, result.freedom, number_format);
     try writer.writeAll(", p=");
-    try printCompact(writer, result.p_value, number_format);
+    try print_compact(writer, result.p_value, number_format);
     try writer.writeByte('\n');
     try writer.print("  {s} at {d:.1}% confidence\n", .{ conclusion, confidence });
 }
 
-fn printNumber(writer: *Io.Writer, value: f64, number_format: NumberFormat) Io.Writer.Error!void {
+fn print_number(writer: *Io.Writer, value: f64, number_format: NumberFormat) Io.Writer.Error!void {
     if (number_format == .scientific) {
         try writer.print(" {e:>13.6}", .{value});
         return;
     }
 
     var buffer: [number_buffer_bytes]u8 = undefined;
-    const number = humanNumber(&buffer, value);
+    const number = human_number(&buffer, value);
     try writer.print(" {s:>[1]}", .{ number, number_width });
 }
 
-fn printCompact(writer: *Io.Writer, value: f64, number_format: NumberFormat) Io.Writer.Error!void {
+fn print_compact(writer: *Io.Writer, value: f64, number_format: NumberFormat) Io.Writer.Error!void {
     if (number_format == .scientific) {
         try writer.print("{e:.6}", .{value});
         return;
     }
 
     var buffer: [number_buffer_bytes]u8 = undefined;
-    try writer.writeAll(humanNumber(&buffer, value));
+    try writer.writeAll(human_number(&buffer, value));
 }
 
-fn humanNumber(buffer: []u8, value: f64) []const u8 {
-    if (value == 0.0 or std.math.isFinite(value) == false) {
+fn human_number(buffer: []u8, value: f64) []const u8 {
+    if (value == 0.0) {
+        return std.fmt.bufPrint(buffer, "{}", .{value}) catch unreachable;
+    }
+    if (std.math.isFinite(value) == false) {
         return std.fmt.bufPrint(buffer, "{}", .{value}) catch unreachable;
     }
 
     const magnitude = @abs(value);
-    if (magnitude < human_scientific_min or magnitude >= human_scientific_max) {
-        const precision = human_significant_digits - 1;
-        const number = std.fmt.bufPrint(
-            buffer,
-            "{e:.[1]}",
-            .{ value, precision },
-        ) catch unreachable;
-        return trimZeros(number);
+    if (magnitude < human_scientific_min) {
+        return scientific_number(buffer, value);
+    }
+    if (magnitude >= human_scientific_max) {
+        return scientific_number(buffer, value);
     }
 
     const exponent: i32 = @intFromFloat(@floor(@log10(magnitude)));
@@ -365,15 +391,29 @@ fn humanNumber(buffer: []u8, value: f64) []const u8 {
     const decimals: usize = if (decimals_signed > 0) @intCast(decimals_signed) else 0;
     const number = std.fmt.bufPrint(buffer, "{d:.[1]}", .{ value, decimals }) catch unreachable;
 
-    return trimZeros(number);
+    return trim_zeros(number);
 }
 
-fn trimZeros(number: []u8) []u8 {
+fn scientific_number(buffer: []u8, value: f64) []const u8 {
+    const precision = human_significant_digits - 1;
+    const number = std.fmt.bufPrint(
+        buffer,
+        "{e:.[1]}",
+        .{ value, precision },
+    ) catch unreachable;
+
+    return trim_zeros(number);
+}
+
+fn trim_zeros(number: []u8) []u8 {
     const exponent_start = std.mem.indexOfScalar(u8, number, 'e') orelse number.len;
     const decimal = std.mem.indexOfScalar(u8, number[0..exponent_start], '.') orelse return number;
 
     var mantissa_end = exponent_start;
-    while (mantissa_end > decimal + 1 and number[mantissa_end - 1] == '0') {
+    while (mantissa_end > decimal + 1) {
+        if (number[mantissa_end - 1] != '0') {
+            break;
+        }
         mantissa_end -= 1;
     }
     if (mantissa_end == decimal + 1) {
@@ -388,13 +428,13 @@ fn trimZeros(number: []u8) []u8 {
     return number[0 .. mantissa_end + exponent.len];
 }
 
-fn printOptional(
+fn print_optional(
     writer: *Io.Writer,
     value: ?f64,
     number_format: NumberFormat,
 ) Io.Writer.Error!void {
     if (value) |number| {
-        try printNumber(writer, number, number_format);
+        try print_number(writer, number, number_format);
         return;
     }
 
@@ -428,34 +468,39 @@ test "small measurements remain visible" {
 
     const options: Options = .{ .quiet = true };
     var input: Io.Reader = .fixed("0.000000001\n");
-    _ = try report(
+    var stats: mustat.Stats = undefined;
+    try report(
         std.testing.allocator,
         &output.writer,
         "test",
         &input,
         &options,
+        &stats,
     );
 
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "1.000000e-9") != null);
 }
 
 test "reject invalid confidence" {
-    try std.testing.expectError(error.InvalidConfidence, parseConfidence("nan"));
-    try std.testing.expectError(error.InvalidConfidence, parseConfidence("0"));
-    try std.testing.expectError(error.InvalidConfidence, parseConfidence("100"));
+    try std.testing.expectError(error.InvalidConfidence, parse_confidence("nan"));
+    try std.testing.expectError(error.InvalidConfidence, parse_confidence("0"));
+    try std.testing.expectError(error.InvalidConfidence, parse_confidence("100"));
 }
 
 test "parse output flags" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    const options = (try parseArgs(
+    var options: Options = .{};
+    const result = try parse_args(
         std.testing.allocator,
         &.{ "-h", "-p", "-x", "data" },
         &output.writer,
-    )).?;
+        &options,
+    );
     defer std.testing.allocator.free(options.files);
 
+    try std.testing.expectEqual(ParseResult.run, result);
     try std.testing.expectEqual(NumberFormat.human, options.number_format);
     try std.testing.expectEqual(Percentiles.included, options.percentiles);
     try std.testing.expectEqual(Summary.extended, options.summary);
@@ -466,7 +511,7 @@ test "select summary headers" {
     defer output.deinit();
 
     var options: Options = .{};
-    try printHeader(&output.writer, &options);
+    try print_header(&output.writer, &options);
     try std.testing.expectEqualStrings(
         "       N           Min           Max        Median           Avg        Stddev\n",
         output.written(),
@@ -475,7 +520,7 @@ test "select summary headers" {
     output.clearRetainingCapacity();
     options.summary = .extended;
     options.percentiles = .included;
-    try printHeader(&output.writer, &options);
+    try print_header(&output.writer, &options);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "Q1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "P99") != null);
 }
@@ -483,22 +528,24 @@ test "select summary headers" {
 test "human numbers adapt to magnitude" {
     var buffer: [number_buffer_bytes]u8 = undefined;
 
-    try std.testing.expectEqualStrings("50", humanNumber(&buffer, 50.0));
-    try std.testing.expectEqualStrings("238.04761", humanNumber(&buffer, 238.047614));
-    try std.testing.expectEqualStrings("1e-9", humanNumber(&buffer, 1e-9));
-    try std.testing.expectEqualStrings("1e9", humanNumber(&buffer, 1e9));
+    try std.testing.expectEqualStrings("50", human_number(&buffer, 50.0));
+    try std.testing.expectEqualStrings("238.04761", human_number(&buffer, 238.047614));
+    try std.testing.expectEqualStrings("1e-9", human_number(&buffer, 1e-9));
+    try std.testing.expectEqualStrings("1e9", human_number(&buffer, 1e9));
 }
 
 test "print Welch comparison" {
     var baseline_values = [_]f64{ 1, 2, 3, 4, 5 };
     var candidate_values = [_]f64{ 2, 3, 4, 5, 6 };
-    const baseline = mustat.calculate(&baseline_values);
-    const candidate = mustat.calculate(&candidate_values);
+    var baseline: mustat.Stats = undefined;
+    var candidate: mustat.Stats = undefined;
+    mustat.calculate(&baseline_values, &baseline);
+    mustat.calculate(&candidate_values, &candidate);
 
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    try printTest(&output.writer, "new", &candidate, "old", &baseline, 95.0, .scientific);
+    try print_test(&output.writer, "new", &candidate, "old", &baseline, 95.0, .scientific);
     const heading = std.mem.indexOf(u8, output.written(), "Welch t-test new vs old");
     try std.testing.expect(heading != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "p=") != null);

@@ -72,6 +72,7 @@ Welch t-test chameleon vs iguana:
 ## Performance
 
 Input bytes are streamed; only parsed values are retained for exact quantiles.
+Lines are limited to 1 MiB and retained values to 4 GiB.
 The hot path uses SIMD compensated accumulation, SIMD extrema detection, and
 bounded multi-selection instead of fully sorting every dataset. Run with:
 
