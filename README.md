@@ -43,14 +43,6 @@ Undefined or non-finite results are `null`. Each dataset after the first has a
 `relative_percent`, `statistic`, `degrees_of_freedom`, `p_value`,
 `confidence_percent`, and `significant`. `-h` and `-q` affect text output only.
 
-```sh
-printf '1\n2\n3\n' | ./zig-out/bin/mustat --json
-```
-
-```json
-{"datasets":[{"name":"<stdin>","stats":{"count":3,"min":1,"max":3,"median":2,"mean":2,"stddev":1}}]}
-```
-
 ## Example
 
 Using the [`ministat` example](https://github.com/leahneukirchen/ministat#example):
@@ -87,6 +79,72 @@ chameleon
 Welch t-test chameleon vs iguana:
   delta=240 (80%), t=1.4888395, df=7.4254283, p=0.17772184
   no difference at 95.0% confidence
+```
+
+### JSON output
+
+Using the same measurements:
+
+```sh
+cat >iguana <<'EOF'
+50
+200
+150
+400
+750
+400
+150
+EOF
+
+cat >chameleon <<'EOF'
+150
+400
+720
+500
+930
+EOF
+
+./zig-out/bin/mustat --json iguana chameleon | python3 -m json.tool
+```
+
+```json
+{
+    "datasets": [
+        {
+            "name": "iguana",
+            "stats": {
+                "count": 7,
+                "min": 50,
+                "max": 750,
+                "median": 200,
+                "mean": 300,
+                "stddev": 238.04761428476166
+            }
+        },
+        {
+            "name": "chameleon",
+            "stats": {
+                "count": 5,
+                "min": 150,
+                "max": 930,
+                "median": 500,
+                "mean": 540,
+                "stddev": 299.0819285747636
+            },
+            "comparison": {
+                "baseline": "iguana",
+                "available": true,
+                "difference": 240,
+                "relative_percent": 80,
+                "statistic": 1.488839530990719,
+                "degrees_of_freedom": 7.425428321242507,
+                "p_value": 0.1777218415434041,
+                "confidence_percent": 95,
+                "significant": false
+            }
+        }
+    ]
+}
 ```
 
 ## Performance
