@@ -25,13 +25,31 @@ Quantiles use R-7 linear interpolation. Dispersion uses the sample variance
 (`N - 1`). Non-finite inputs are rejected.
 
 ```text
-Usage: mustat [-Ahnpqx] [-C column] [-c confidence] [-d delimiters] [file ...]
+Usage: mustat [-Ahnjpqx] [-C column] [-c confidence] [-d delimiters] [file ...]
 ```
 
 Use `-C` to select a one-based column and `-d` to provide delimiter bytes.
 Blank lines, missing columns, and `#` comments are ignored. Multiple files are
 reported independently; `-` reads standard input. Use `-h` for adaptive,
 eight-significant-digit number formatting. Use `--help` for usage.
+
+Use `-j` or `--json` to write one JSON document. It has a `datasets` array in
+input order. Each entry has a `name` and a `stats` object. By default, `stats`
+contains `count`, `min`, `max`, `median`, `mean`, and `stddev`. `-x` adds `q1`,
+`q3`, `iqr`, `stderr`, and `cv_percent`; `-p` adds `p90`, `p95`, and `p99`.
+Undefined or non-finite results are `null`. Each dataset after the first has a
+`comparison` object unless `-n` is set. It names the baseline and has an
+`available` flag. Available comparisons include `difference`,
+`relative_percent`, `statistic`, `degrees_of_freedom`, `p_value`,
+`confidence_percent`, and `significant`. `-h` and `-q` affect text output only.
+
+```sh
+printf '1\n2\n3\n' | ./zig-out/bin/mustat --json
+```
+
+```json
+{"datasets":[{"name":"<stdin>","stats":{"count":3,"min":1,"max":3,"median":2,"mean":2,"stddev":1}}]}
+```
 
 ## Example
 

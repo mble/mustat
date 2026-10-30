@@ -20,6 +20,11 @@ const NumberFormat = enum {
     human,
 };
 
+const OutputFormat = enum {
+    text,
+    json,
+};
+
 const Summary = enum {
     standard,
     extended,
@@ -45,11 +50,17 @@ const Options = struct {
     confidence: f64 = confidence_default,
     delimiters: []const u8 = " \t",
     number_format: NumberFormat = .scientific,
+    output_format: OutputFormat = .text,
     percentiles: Percentiles = .omitted,
     quiet: bool = false,
     summary: Summary = .standard,
     test_output: TestOutput = .enabled,
     files: []const []const u8 = &.{},
+};
+
+const Baseline = struct {
+    name: []const u8,
+    stats: *const mustat.Stats,
 };
 
 const CliError = error{
@@ -91,6 +102,12 @@ fn run(init: std.process.Init, stdout: *Io.Writer) !void {
     var baseline: mustat.Stats = undefined;
     var baseline_name: []const u8 = undefined;
     var baseline_set = false;
+    var json: std.json.Stringify = .{ .writer = stdout, .options = .{} };
+    if (options.output_format == .json) {
+        try json.beginObject();
+        try json.objectField("datasets");
+        try json.beginArray();
+    }
     for (paths) |path| {
         const is_stdin = std.mem.eql(u8, path, "-");
         const file = if (is_stdin)
@@ -109,9 +126,23 @@ fn run(init: std.process.Init, stdout: *Io.Writer) !void {
         const name = if (is_stdin) "<stdin>" else path;
 
         var stats: mustat.Stats = undefined;
-        try report(init.gpa, stdout, name, &input_file.interface, &options, &stats);
+        if (options.output_format == .json) {
+            try calculate_stats(init.gpa, name, &input_file.interface, &options, &stats);
+            try print_json_dataset(
+                &json,
+                name,
+                &stats,
+                if (baseline_set and options.test_output == .enabled)
+                    Baseline{ .name = baseline_name, .stats = &baseline }
+                else
+                    null,
+                &options,
+            );
+        } else {
+            try report(init.gpa, stdout, name, &input_file.interface, &options, &stats);
+        }
         if (baseline_set) {
-            if (options.test_output == .enabled) {
+            if (options.test_output == .enabled and options.output_format == .text) {
                 try print_test(
                     stdout,
                     name,
@@ -128,6 +159,11 @@ fn run(init: std.process.Init, stdout: *Io.Writer) !void {
         baseline = stats;
         baseline_name = name;
         baseline_set = true;
+    }
+    if (options.output_format == .json) {
+        try json.endArray();
+        try json.endObject();
+        try stdout.writeByte('\n');
     }
 }
 
@@ -166,6 +202,10 @@ fn parse_args(
         }
         if (std.mem.eql(u8, argument, "--human")) {
             options.number_format = .human;
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--json")) {
+            options.output_format = .json;
             continue;
         }
         if (std.mem.eql(u8, argument, "--percentiles")) {
@@ -211,6 +251,7 @@ fn parse_short(
         switch (option) {
             'A' => {},
             'h' => options.number_format = .human,
+            'j' => options.output_format = .json,
             'n' => options.test_output = .disabled,
             'p' => options.percentiles = .included,
             'q' => options.quiet = true,
@@ -298,6 +339,23 @@ inline fn report(
     options: *const Options,
     stats: *mustat.Stats,
 ) !void {
+    try calculate_stats(allocator, name, reader, options, stats);
+
+    if (options.quiet == false) {
+        try writer.print("{s}\n", .{name});
+        try print_header(writer, options);
+    }
+
+    try print_stats(writer, stats, options);
+}
+
+fn calculate_stats(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    reader: *Io.Reader,
+    options: *const Options,
+    stats: *mustat.Stats,
+) !void {
     const parse_options: mustat.ParseOptions = .{
         .column = options.column,
         .delimiters = options.delimiters,
@@ -309,13 +367,74 @@ inline fn report(
     defer allocator.free(values);
 
     mustat.calculate(values, stats);
+}
 
-    if (options.quiet == false) {
-        try writer.print("{s}\n", .{name});
-        try print_header(writer, options);
+fn print_json_dataset(
+    json: *std.json.Stringify,
+    name: []const u8,
+    stats: *const mustat.Stats,
+    baseline: ?Baseline,
+    options: *const Options,
+) Io.Writer.Error!void {
+    try json.beginObject();
+    try json.objectField("name");
+    try json.write(name);
+    try json.objectField("stats");
+    try json.beginObject();
+    try json.objectField("count");
+    try json.write(stats.count);
+    try json_number(json, "min", stats.min);
+    try json_number(json, "max", stats.max);
+    try json_number(json, "median", stats.median);
+    try json_number(json, "mean", stats.mean);
+    try json_number(json, "stddev", stats.stddev);
+    if (options.summary == .extended) {
+        try json_number(json, "q1", stats.q1);
+        try json_number(json, "q3", stats.q3);
+        try json_number(json, "iqr", stats.iqr);
+        try json_number(json, "stderr", stats.stderr);
+        try json_number(json, "cv_percent", stats.cv_percent);
     }
+    if (options.percentiles == .included) {
+        try json_number(json, "p90", stats.p90);
+        try json_number(json, "p95", stats.p95);
+        try json_number(json, "p99", stats.p99);
+    }
+    try json.endObject();
 
-    try print_stats(writer, stats, options);
+    if (baseline) |reference| {
+        try json.objectField("comparison");
+        try json.beginObject();
+        try json.objectField("baseline");
+        try json.write(reference.name);
+        var result: mustat.TTest = undefined;
+        const available = mustat.welch(stats, reference.stats, &result);
+        try json.objectField("available");
+        try json.write(available);
+        if (available) {
+            try json_number(json, "difference", result.difference);
+            try json_number(json, "relative_percent", result.relative_percent);
+            try json_number(json, "statistic", result.statistic);
+            try json_number(json, "degrees_of_freedom", result.freedom);
+            try json_number(json, "p_value", result.p_value);
+            try json_number(json, "confidence_percent", options.confidence);
+            try json.objectField("significant");
+            try json.write(result.p_value < 1.0 - options.confidence / percent_scale);
+        }
+        try json.endObject();
+    }
+    try json.endObject();
+}
+
+fn json_number(json: *std.json.Stringify, key: []const u8, value: ?f64) Io.Writer.Error!void {
+    try json.objectField(key);
+    if (value) |number| {
+        if (std.math.isFinite(number)) {
+            try json.write(number);
+            return;
+        }
+    }
+    try json.write(null);
 }
 
 fn print_header(writer: *Io.Writer, options: *const Options) Io.Writer.Error!void {
@@ -494,12 +613,13 @@ fn print_optional(
 
 fn usage(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.writeAll(
-        \\Usage: mustat [-Ahnpqx] [-C column] [-c confidence] [-d delimiters] [file ...]
+        \\Usage: mustat [-Ahnjpqx] [-C column] [-c confidence] [-d delimiters] [file ...]
         \\
         \\  -C, --column N       Read one-based column N (default: 1)
         \\  -c, --confidence N   Set comparison confidence (default: 95)
         \\  -d, --delimiters S   Split on any byte in S (default: space and tab)
         \\  -h, --human          Use adaptive number formatting
+        \\  -j, --json           Write one JSON document
         \\  -p, --percentiles    Include P90, P95, and P99
         \\  -q, --quiet          Omit headers and dataset names
         \\  -x, --extended       Include extended summary statistics
@@ -545,7 +665,7 @@ test "parse output flags" {
     var options: Options = .{};
     const result = try parse_args(
         std.testing.allocator,
-        &.{ "-Ahpqxn", "data" },
+        &.{ "-Ahjpqxn", "data" },
         &output.writer,
         &options,
     );
@@ -553,9 +673,79 @@ test "parse output flags" {
 
     try std.testing.expectEqual(ParseResult.run, result);
     try std.testing.expectEqual(NumberFormat.human, options.number_format);
+    try std.testing.expectEqual(OutputFormat.json, options.output_format);
     try std.testing.expectEqual(Percentiles.included, options.percentiles);
     try std.testing.expectEqual(Summary.extended, options.summary);
     try std.testing.expectEqual(TestOutput.disabled, options.test_output);
+}
+
+test "parse long JSON flag" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    var options: Options = .{};
+    _ = try parse_args(std.testing.allocator, &.{"--json"}, &output.writer, &options);
+    defer std.testing.allocator.free(options.files);
+    try std.testing.expectEqual(OutputFormat.json, options.output_format);
+}
+
+test "JSON datasets use selected fields and escape names" {
+    var baseline_values = [_]f64{ 1, 2, 3, 4, 5 };
+    var candidate_values = [_]f64{ 2, 3, 4, 5, 6 };
+    var baseline: mustat.Stats = undefined;
+    var candidate: mustat.Stats = undefined;
+    mustat.calculate(&baseline_values, &baseline);
+    mustat.calculate(&candidate_values, &candidate);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    const options: Options = .{ .summary = .extended, .percentiles = .included };
+    try json.beginObject();
+    try json.objectField("datasets");
+    try json.beginArray();
+    try print_json_dataset(&json, "old\"name", &baseline, null, &options);
+    try print_json_dataset(&json, "new", &candidate, .{ .name = "old\"name", .stats = &baseline }, &options);
+    try json.endArray();
+    try json.endObject();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    const datasets = parsed.value.object.get("datasets").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), datasets.len);
+    try std.testing.expectEqualStrings("old\"name", datasets[0].object.get("name").?.string);
+    try std.testing.expect(datasets[0].object.get("comparison") == null);
+    const stats = datasets[1].object.get("stats").?.object;
+    try std.testing.expectEqual(@as(i64, 5), stats.get("count").?.integer);
+    try std.testing.expect(stats.get("q1") != null);
+    try std.testing.expect(stats.get("p99") != null);
+    const comparison = datasets[1].object.get("comparison").?.object;
+    try std.testing.expect(comparison.get("available").?.bool);
+    try std.testing.expectEqualStrings("old\"name", comparison.get("baseline").?.string);
+    try std.testing.expect(comparison.get("p_value") != null);
+}
+
+test "JSON uses null for undefined and non-finite values" {
+    var values = [_]f64{42};
+    var stats: mustat.Stats = undefined;
+    mustat.calculate(&values, &stats);
+    stats.iqr = std.math.inf(f64);
+
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    try print_json_dataset(&json, "one", &stats, .{ .name = "base", .stats = &stats }, &.{ .summary = .extended });
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    const record = parsed.value.object;
+    const fields = record.get("stats").?.object;
+    try std.testing.expect(fields.get("stddev").? == .null);
+    try std.testing.expect(fields.get("iqr").? == .null);
+    try std.testing.expect(fields.get("p90") == null);
+    const comparison = record.get("comparison").?.object;
+    try std.testing.expect(comparison.get("available").?.bool == false);
+    try std.testing.expect(comparison.get("p_value") == null);
 }
 
 test "parse attached option values" {
